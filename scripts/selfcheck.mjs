@@ -27,17 +27,38 @@ async function checkAsync(name, fn) {
 }
 
 // ---------- 内存版 Blob / KV 假实现，用于验证适配层契约 ----------
+// 记录每次读调用收到的 options，用来断言一致性参数真的传下去了
 function fakeBlobStore() {
   const m = new Map();
+  const calls = { get: [], list: [] };
   return {
+    __calls: calls,
     async set(k, v) { m.set(String(k), typeof v === 'string' ? v : String(v)); },
-    async get(k) { return m.has(String(k)) ? m.get(String(k)) : null; },
+    async setJSON(k, v) { m.set(String(k), JSON.stringify(v)); },
+    async get(k, opts) {
+      calls.get.push({ key: String(k), opts: opts });
+      return m.has(String(k)) ? m.get(String(k)) : null;
+    },
     async delete(k) { m.delete(String(k)); },
     async list(opts) {
+      calls.list.push(opts);
       const prefix = (opts && opts.prefix) || '';
       const blobs = [...m.keys()].filter(k => k.startsWith(prefix)).map(k => ({ key: k, etag: 'e' + k.length }));
       return { blobs };
     },
+  };
+}
+
+// 抛指定错误码的 Blob Store，用来验证错误不会被静默吞掉
+function throwingBlobStore(code) {
+  const e = new Error('simulated ' + code);
+  e.code = code;
+  return {
+    async set() { throw e; },
+    async setJSON() { throw e; },
+    async get() { throw e; },
+    async delete() { throw e; },
+    async list() { throw e; },
   };
 }
 
@@ -136,6 +157,59 @@ async function main() {
   console.log('\n=== 2. 存储适配层 ===');
   await runR2Contract('Blob 后端', blobBackend.makeBlobBackend(fakeBlobStore()));
   await runR2Contract('KV 后端', kvBackend.makeKvBackend(fakeKvNamespace()));
+
+  console.log('\n[Blob 后端] 一致性与错误可见性');
+  await checkAsync('读操作默认带 consistency=strong（SDK 默认是 eventual，会让刚写完读不到）', async () => {
+    const raw = fakeBlobStore();
+    const store = blobBackend.makeBlobBackend(raw);
+    await store.put('c/a', 'v');
+    await store.get('c/a');
+    await store.list({ prefix: 'c/' });
+    assert.equal(store.__consistency, 'strong');
+    assert.ok(raw.__calls.get.length >= 1, 'get 应被调用');
+    assert.equal(raw.__calls.get[0].opts.consistency, 'strong', 'get 必须显式传 consistency');
+    assert.equal(raw.__calls.list[0].consistency, 'strong', 'list 必须显式传 consistency');
+  });
+
+  await checkAsync('BLOB_CONSISTENCY=eventual 时可切回最终一致', async () => {
+    const raw = fakeBlobStore();
+    const store = blobBackend.makeBlobBackend(raw, { consistency: 'eventual' });
+    await store.put('c/b', 'v');
+    await store.get('c/b');
+    assert.equal(store.__consistency, 'eventual');
+    assert.equal(raw.__calls.get[0].opts.consistency, 'eventual');
+  });
+
+  await checkAsync('consistency 取值非法时按 strong 处理（不静默变成 eventual）', () => {
+    assert.equal(blobBackend.normalizeConsistency('STRONG'), 'strong');
+    assert.equal(blobBackend.normalizeConsistency(''), 'strong');
+    assert.equal(blobBackend.normalizeConsistency(undefined), 'strong');
+    assert.equal(blobBackend.normalizeConsistency('乱七八糟'), 'strong');
+    assert.equal(blobBackend.normalizeConsistency('eventual'), 'eventual');
+  });
+
+  await checkAsync('底层报错不会被伪装成「读不到」——错误码被记录下来', async () => {
+    const store = blobBackend.makeBlobBackend(throwingBlobStore('QUOTA_EXCEEDED'));
+    blobBackend.clearBlobError();
+    // 读失败仍返回 null（保持上层行为不变），但错误必须被记下
+    assert.equal(await store.get('x'), null);
+    const err = blobBackend.blobLastError();
+    assert.ok(err, '应记录错误');
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    assert.equal(err.op, 'get');
+    assert.match(blobBackend.hintForCode('QUOTA_EXCEEDED'), /1GB/);
+    blobBackend.clearBlobError();
+    assert.equal(blobBackend.blobLastError(), null);
+  });
+
+  await checkAsync('写失败必须抛出（丢数据比报错严重），同时记录错误', async () => {
+    const store = blobBackend.makeBlobBackend(throwingBlobStore('RATE_LIMITED'));
+    blobBackend.clearBlobError();
+    await assert.rejects(() => store.put('y', 'v'));
+    assert.equal(blobBackend.blobLastError().op, 'put');
+    assert.equal(blobBackend.blobLastError().code, 'RATE_LIMITED');
+    blobBackend.clearBlobError();
+  });
 
   console.log('\n[KV 后端] 专属行为');
   await checkAsync('key 编码可逆（含中文与斜杠）', () => {
@@ -414,43 +488,137 @@ async function main() {
     }
   });
 
-  await checkAsync('任意变量名绑定的 Blob 都能被自动发现（无需 EO_BLOB_BINDING）', () => {
+  await checkAsync('Blob 不做绑定名全量扫描（控制台只读，没有绑定机制）', () => {
+    // 即便 globalThis 上真有个长得像 Blob Store 的对象，也不该被认成「绑定」
     globalThis.MY_WEIRD_BLOB = fakeBlobStore();
     try {
-      const found = edgeStore.detectBlobBinding({}, {});
-      assert.ok(found, '应发现 Blob 绑定');
-      assert.equal(found.name, 'globalThis.MY_WEIRD_BLOB');
+      assert.equal(edgeStore.detectBlobBinding({}, {}), null, '未显式指定时不应发现任何绑定');
     } finally {
       delete globalThis.MY_WEIRD_BLOB;
     }
   });
 
-  await checkAsync('EO_BLOB_BINDING 显式指定时优先命中该名字', () => {
+  await checkAsync('EO_BLOB_BINDING 逃生口：显式指定时才注入自建 Store', () => {
     globalThis.BLOB_ALPHA = fakeBlobStore();
     globalThis.BLOB_BETA = fakeBlobStore();
     try {
       const found = edgeStore.detectBlobBinding({}, { EO_BLOB_BINDING: 'BLOB_BETA' });
+      assert.ok(found, '显式指定应命中');
       assert.equal(found.name, 'globalThis.BLOB_BETA');
+      // 形态不符（KV 没有 set）时不能误认
+      globalThis.BLOB_ALPHA = fakeKvNamespace();
+      assert.equal(edgeStore.detectBlobBinding({}, { EO_BLOB_BINDING: 'BLOB_ALPHA' }), null);
     } finally {
       delete globalThis.BLOB_ALPHA;
       delete globalThis.BLOB_BETA;
     }
   });
 
-  await checkAsync('端到端：控制台绑定的 Blob 被接管为 env.R2，且真的能写能读', async () => {
+  await checkAsync('端到端：注入的 Blob Store 被接管为 env.R2，且真的能写能读', async () => {
     const bound = fakeBlobStore();
     edgeStore.__resetForTest();
     try {
       const res = await mod.handle({
         // ?probe=1 会真实写入并读回一个临时对象 —— 这一步才证明存储「能用」而不只是「能加载」
         request: new Request('https://example.com/healthz?probe=1'),
-        env: { BLOB: bound, STORAGE_DEBUG: '1' },
+        env: { EO_BLOB_BINDING: 'BLOB', BLOB: bound, STORAGE_DEBUG: '1' },
         waitUntil: () => {},
       });
       const j = await res.json();
-      assert.equal(j.storage, 'blob(env.BLOB)', '应优先使用控制台绑定的那个命名空间');
+      assert.equal(j.storage, 'blob(env.BLOB)');
       assert.equal(j.debug.blobBindingUsed, 'env.BLOB');
       assert.equal(j.debug.probe.ok, true, '真实读写应成功');
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  console.log('\n=== 6c. Blob 命名空间自动创建（provision） ===');
+
+  await checkAsync('首个请求会异步创建命名空间：写入并读回 __meta__/provision.json', async () => {
+    const raw = fakeBlobStore();
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { EO_BLOB_BINDING: 'BLOB', BLOB: raw },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.storage, 'blob(env.BLOB)');
+      // 置备是异步的（交给 waitUntil），这里等它落定
+      await edgeStore.__awaitProvision();
+      const written = await raw.get(edgeStore.PROVISION_KEY);
+      assert.ok(written, '应写入置备标记对象');
+      const meta = JSON.parse(written);
+      assert.equal(meta.namespace, 'cloudflare-chat');
+      assert.ok(meta.provisioned_at, '应带创建时间');
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('置备结果在 /healthz 的 debug.provision 里可见', async () => {
+    const raw = fakeBlobStore();
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { EO_BLOB_BINDING: 'BLOB', BLOB: raw, STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.ok(j.debug.provision, '应输出置备状态');
+      assert.equal(j.debug.provision.namespace, 'cloudflare-chat');
+      await edgeStore.__awaitProvision();
+      // 再请求一次，此时应已就绪
+      const res2 = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { EO_BLOB_BINDING: 'BLOB', BLOB: raw, STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j2 = await res2.json();
+      assert.equal(j2.debug.provision.state, 'ready');
+      assert.equal(j2.debug.provision.ok, true);
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('BLOB_AUTOPROVISION=0 时不产生任何写入', async () => {
+    const raw = fakeBlobStore();
+    edgeStore.__resetForTest();
+    try {
+      await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { EO_BLOB_BINDING: 'BLOB', BLOB: raw, BLOB_AUTOPROVISION: '0', STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      await edgeStore.__awaitProvision();
+      assert.equal(await raw.get(edgeStore.PROVISION_KEY), null, '不应写入置备标记');
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('置备失败时被如实记录（不假装成功）', async () => {
+    edgeStore.__resetForTest();
+    try {
+      await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { EO_BLOB_BINDING: 'BLOB', BLOB: throwingBlobStore('QUOTA_EXCEEDED'), STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      await edgeStore.__awaitProvision();
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { EO_BLOB_BINDING: 'BLOB', BLOB: throwingBlobStore('QUOTA_EXCEEDED'), STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.debug.provision.state, 'failed');
+      assert.equal(j.debug.provision.ok, false);
+      assert.match(j.debug.provision.error, /1GB/);
     } finally {
       edgeStore.__resetForTest();
     }
@@ -487,10 +655,84 @@ async function main() {
       const j = await res.json();
       assert.equal(j.debug.mode, 'blob', '未设置 STORAGE_BACKEND 时应回显默认值 blob');
       assert.equal(j.debug.namespace, 'cloudflare-chat');
+      assert.equal(j.debug.consistency, 'strong', '读取一致性默认应为 strong');
       assert.equal(j.debug.blobBindingUsed, null);
-      assert.ok(Array.isArray(j.debug.blobCandidates));
+      assert.ok(j.debug.provision, '应输出置备状态');
+      assert.ok(Array.isArray(j.debug.kvCandidates));
       assert.equal(j.debug.warning, undefined, '合法取值不应有 warning');
     } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('BLOB_CONSISTENCY=eventual 时排障输出如实反映', async () => {
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { STORAGE_DEBUG: '1', BLOB_CONSISTENCY: 'eventual' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.debug.consistency, 'eventual');
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('真实 SDK 接入路径：本地无 Makers 凭证时优雅降级并说明缺什么', async () => {
+    // 装了依赖就用真 SDK 走一遍（能验证 import 与 getStore 的真实行为）；
+    // 没装依赖则验证「依赖缺失」这条路径的提示是否清晰。两种情况都必须降级为 memory 而不是崩掉。
+    let sdkAvailable = true;
+    try { await import('@edgeone/pages-blob'); } catch (e) { sdkAvailable = false; }
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.storage, 'memory', '无凭证时必须降级为 memory');
+      if (sdkAvailable) {
+        assert.match(j.debug.blobError, /getStore 调用失败/, '应指出是 getStore 阶段失败');
+        assert.match(j.debug.blobError, /Makers/, '应给出「不在 Makers 环境」的可操作提示');
+      } else {
+        assert.match(j.debug.blobError, /import 失败/, '应指出是依赖未安装');
+      }
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('存储读写错误会在排障输出里摊开（不再伪装成「知识库是空的」）', async () => {
+    edgeStore.__resetForTest();
+    blobBackend.clearBlobError();
+    const throwingEnv = {
+      EO_BLOB_BINDING: 'BLOB',
+      BLOB: throwingBlobStore('QUOTA_EXCEEDED'),
+      STORAGE_DEBUG: '1',
+    };
+    try {
+      // 首个请求会触发自动置备，置备写入失败 → 错误被记录
+      await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: throwingEnv,
+        waitUntil: () => {},
+      });
+      await edgeStore.__awaitProvision();
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: throwingEnv,
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.ok(j.debug.lastStorageError, '应暴露最近一次存储错误');
+      assert.equal(j.debug.lastStorageError.code, 'QUOTA_EXCEEDED');
+      assert.equal(j.debug.lastStorageError.op, 'provision');
+      assert.match(j.debug.lastStorageError.hint, /1GB/);
+    } finally {
+      blobBackend.clearBlobError();
       edgeStore.__resetForTest();
     }
   });
@@ -533,11 +775,12 @@ async function main() {
     try {
       const res = await mod.handle({
         request: new Request('https://example.com/healthz'),
-        env: { BLOB: bound, STORAGE_DEBUG: '1' },
+        env: { EO_BLOB_BINDING: 'BLOB', BLOB: bound, STORAGE_DEBUG: '1', BLOB_AUTOPROVISION: '0' },
         waitUntil: () => {},
       });
       const j = await res.json();
-      assert.equal(j.debug.probe, undefined);
+      assert.equal(j.storage, 'blob(env.BLOB)', '存储应已接通');
+      assert.equal(j.debug.probe, undefined, '未加 ?probe=1 时不应做探测写入');
     } finally {
       edgeStore.__resetForTest();
     }

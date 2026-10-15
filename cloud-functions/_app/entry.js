@@ -20,7 +20,7 @@ import { MANIFEST_JSON } from './pwa/manifest.js';
 import { SW_JS } from './pwa/service-worker.js';
 import { getPwaVersion } from './pwa/version.js';
 import { HTML_CONTENT } from './ui/index.js';
-import { resolveStore, activeBackendName, storageDiagnostics, probeStore } from './store/edge-store.js';
+import { resolveStore, ensureProvisioned, activeBackendName, storageDiagnostics, probeStore } from './store/edge-store.js';
 import { loadStoredImage, buildImageSseResponse, IMG_URL_PATH } from './images.js';
 
 // 把 EdgeOne 的 context.env 包一层，在保留原有全部环境变量的同时，
@@ -248,6 +248,10 @@ async function handle(context) {
     // EdgeOne 原始 context：仅供存储层自动发现 KV 绑定与 /healthz 排障输出使用
     __context: context,
   };
+
+  // 自动创建 Blob 命名空间：首个请求时异步跑一次「写标记 + 读回校验」，不阻塞本次响应。
+  // 放在这里（而不是模块顶层）是因为需要 waitUntil 托管，避免响应结束后写入被截断。
+  try { ensureProvisioned(rawEnv, ctx, store); } catch (e) {}
 
   const res = await routeRequest(request, env, ctx);
   return applyCorsOrigin(res, env, request);

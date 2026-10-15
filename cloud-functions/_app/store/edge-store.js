@@ -5,18 +5,22 @@
 //   agent/resume.js、agent/mode.js、telegram/handler.js 全部直接调用 env.R2.get/put/delete/list，
 //   所以这里只要提供一个接口一致的替身，那 8 个文件一行都不用改。
 //
-// ============ 关于「自动绑定」的现实边界（重要） ============
-//   Blob：**完全自动**。调用 getStore(name) 时平台会自动为项目创建该命名空间，
-//         控制台无需任何操作。这也是默认后端。
-//         另外，若你在控制台把 Blob 命名空间绑定成了某个变量（任意名字），
-//         本层也能自动识别并优先使用它，避免「控制台绑一个、数据写进另一个」。
-//   KV  ：**无法自动置备**。EdgeOne 没有提供 KV 的 SDK 或管理 API
-//         （npm 上只有 @edgeone/pages-blob，没有 @edgeone/pages-kv），
-//         命名空间只能在「控制台 → 存储 → KV 存储」里创建并绑定到项目。
-//         而且官方明确 KV 当前仅支持在 Edge Functions 中使用，Cloud Functions 不可用。
-//         → 因此本层能做的「自动」是：**绑定名自动发现**。
-//           你在控制台把命名空间绑成什么变量名都行，代码都能自己认出来，
-//           不需要设置 EO_KV_BINDING。绑定一次即可，之后零配置。
+// ============ 「自动创建 / 自动绑定」的真实边界（重要） ============
+//
+//   Blob（本项目唯一使用的后端）
+//     创建：**完全自动**。首次 getStore("name") 时平台为项目自动创建该命名空间。
+//           本层在首个请求时还会异步写一个 __meta__/provision.json 标记并读回校验，
+//           让「创建」从「首次写入时顺带发生」变成「启动即确认」——见 ensureProvisioned()。
+//     绑定：**不存在这一步**。官方文档明确：Blob 在控制台仅支持只读浏览
+//           （查看命名空间列表、浏览对象目录），命名空间的创建与所有数据操作都走 SDK。
+//           所以「把 Blob 绑定到某个变量名」这件事在 EdgeOne 上根本没有入口，
+//           代码里也不需要认绑定名。环境变量 EO_BLOB_BINDING 仅作为逃生口保留：
+//           当你在自检/本地脚本里自己构造了一个 Store 实例想注入时才会用到。
+//
+//   KV（备选，仅 Edge Functions 可用）
+//     创建：**无法自动**。没有 SDK、没有管理 API，只能控制台手动创建命名空间。
+//     绑定：只能控制台手动绑定。→ 本层能做的是**绑定名自动发现**：
+//           你在控制台绑成什么变量名都行，代码都能自己认出来，不需要 EO_KV_BINDING。
 //
 // 后端选择（可用环境变量 STORAGE_BACKEND 覆盖）：
 //   blob（默认）→ EdgeOne Blob 存储（@edgeone/pages-blob）。语义最接近 R2、key 无字符集限制、
@@ -29,18 +33,20 @@
 //
 // 相关环境变量：
 //   STORAGE_BACKEND      blob（默认）| kv | auto | none
-//   EO_BLOB_NAMESPACE    Blob 命名空间名，默认 cloudflare-chat
-//   EO_BLOB_BINDING      指定 Blob 绑定名（一般不需要——不填会自动发现）
+//   EO_BLOB_NAMESPACE    Blob 命名空间名，默认 cloudflare-chat（自动创建）
+//   BLOB_CONSISTENCY     strong（默认）| eventual —— 读取一致性
+//   BLOB_AUTOPROVISION   1（默认）| 0 —— 是否在首个请求时自动创建并校验命名空间
+//   EO_BLOB_BINDING      逃生口：注入自建的 Store 实例（一般不需要）
 //   EO_KV_BINDING        指定 KV 绑定名（一般不需要——不填会自动发现）
 //   STORAGE_DEBUG        设为 1 时，/healthz 会额外输出后端探测详情；再加 ?probe=1 会真实读写一次
 
-import { makeBlobBackend } from './blob-backend.js';
+import { makeBlobBackend, normalizeConsistency, blobLastError, hintForCode } from './blob-backend.js';
 import { makeKvBackend } from './kv-backend.js';
 
 const DEFAULT_BLOB_NAMESPACE = 'cloudflare-chat';
+const PROVISION_KEY = '__meta__/provision.json';
 // 优先按这些常见名字找，命中即返回，避免全量扫描
 const DEFAULT_KV_BINDING_NAMES = ['CHAT_KV', 'KV', 'STORAGE', 'EO_KV', 'EDGEONE_KV', 'CLOUDFLARE_CHAT_KV'];
-const DEFAULT_BLOB_BINDING_NAMES = ['BLOB', 'CHAT_BLOB', 'STORAGE_BLOB', 'EO_BLOB', 'EDGEONE_BLOB', 'CLOUDFLARE_CHAT_BLOB'];
 // 全量扫描时要跳过的全局名，避免误触 getter 或匹配到无关对象。
 // 特别注意 'R2'：那是本层自己挂上去的 R2 替身，它同样有 get/put/delete/list，
 // 若不排除会被当成 KV 再包一层，造成自我套娃。
@@ -65,6 +71,17 @@ const FAIL_RETRY_MS = 15000;
 let lastBlobError = '';
 let lastBlobFound = '';
 let lastKvFound = '';
+let lastConsistency = '';
+
+// 自动置备状态（每个 isolate 一份）
+let provisionState = { state: 'idle', ok: false, at: 0, namespace: '', error: '' };
+let provisionInFlight = null;
+let provisionLastAttempt = 0;
+const PROVISION_RETRY_MS = 60000;
+
+function errText(e) {
+  return (e && e.message) ? String(e.message).slice(0, 300) : String(e).slice(0, 300);
+}
 
 // 判断一个对象「像不像 KV 命名空间」。
 // KV 的签名是 get / put / delete / list；Blob 的 Store 用的是 set（没有 put），
@@ -79,7 +96,7 @@ function looksLikeKvNamespace(v) {
 
 // 判断一个对象「像不像 Blob Store」。
 // Blob 的签名是 set / get / delete / list，且**没有 put**（put 是 KV 的特征键）。
-// 多要求 get 与 delete，是为了避免把某个恰好带 set+list 的无关对象当成存储。
+// 仅用于 EO_BLOB_BINDING 逃生口的形态校验 —— Blob 没有控制台绑定机制，不做全量扫描。
 function looksLikeBlobStore(v) {
   return !!v
     && typeof v === 'object'
@@ -150,50 +167,31 @@ function listKvCandidates(context, env) {
   return out;
 }
 
-// 自动发现 Blob 绑定：与 KV 同一套策略，让你在控制台把 Blob 命名空间绑成任意变量名都能被接管。
-// 注意这只是「锦上添花」——不绑任何变量时，SDK 的 getStore(name) 也能自动创建并使用命名空间。
+// EO_BLOB_BINDING 逃生口：只认显式指定的名字。
+// 为什么不做全量扫描：Blob 没有「绑定到变量」这个机制（控制台只读），
+// 扫出来的任何东西都只可能是误判 —— 比如某个恰好带 set/get/list 的无关对象。
 function detectBlobBinding(context, env) {
-  const sources = collectSources(context, env);
-
   const explicit = env && env.EO_BLOB_BINDING ? String(env.EO_BLOB_BINDING) : '';
-  if (explicit) {
-    for (const s of sources) {
-      let v;
-      try { v = s.obj[explicit]; } catch (e) { continue; }
-      if (looksLikeBlobStore(v)) return { store: v, name: s.label + '.' + explicit };
-    }
+  if (!explicit) return null;
+  for (const s of collectSources(context, env)) {
+    let v;
+    try { v = s.obj[explicit]; } catch (e) { continue; }
+    if (looksLikeBlobStore(v)) return { store: v, name: s.label + '.' + explicit };
   }
-
-  for (const n of DEFAULT_BLOB_BINDING_NAMES) {
-    for (const s of sources) {
-      let v;
-      try { v = s.obj[n]; } catch (e) { continue; }
-      if (looksLikeBlobStore(v)) return { store: v, name: s.label + '.' + n };
-    }
-  }
-
-  for (const s of sources) {
-    let keys;
-    try { keys = Object.getOwnPropertyNames(s.obj); } catch (e) { continue; }
-    for (const k of keys) {
-      if (SCAN_SKIP.has(k)) continue;
-      let v;
-      try { v = s.obj[k]; } catch (e) { continue; }
-      if (looksLikeBlobStore(v)) return { store: v, name: s.label + '.' + k };
-    }
-  }
-
   return null;
 }
 
 async function tryCreateBlob(env, context) {
-  // 先看有没有在控制台绑定的 Blob 命名空间。绑定了就优先用它——
-  // 否则会退到 SDK 默认命名空间，导致「控制台绑了一个、数据写到另一个」的割裂。
+  const consistency = normalizeConsistency(env && env.BLOB_CONSISTENCY);
+  const name = String((env && env.EO_BLOB_NAMESPACE) || DEFAULT_BLOB_NAMESPACE);
+
+  // 逃生口：显式注入的 Store 实例（自检 / 本地脚本用）
   const bound = detectBlobBinding(context, env);
   if (bound) {
     lastBlobError = '';
     lastBlobFound = bound.name;
-    return { store: makeBlobBackend(bound.store), name: 'blob(' + bound.name + ')' };
+    lastConsistency = consistency;
+    return { store: makeBlobBackend(bound.store, { consistency }), name: 'blob(' + bound.name + ')' };
   }
   lastBlobFound = '';
 
@@ -202,7 +200,7 @@ async function tryCreateBlob(env, context) {
     // 动态引入：未安装 @edgeone/pages-blob 时不至于让整个函数加载失败
     mod = await import('@edgeone/pages-blob');
   } catch (e) {
-    lastBlobError = 'import 失败：' + (e && e.message ? e.message : String(e));
+    lastBlobError = 'import 失败：' + errText(e);
     return null;
   }
   // 该 SDK 是 CommonJS 产物（module.exports = { getStore, ... }），
@@ -215,17 +213,28 @@ async function tryCreateBlob(env, context) {
     return null;
   }
   try {
-    const name = String((env && env.EO_BLOB_NAMESPACE) || DEFAULT_BLOB_NAMESPACE);
-    // 首次调用时平台会自动为项目创建该命名空间 —— 这是「零控制台操作」的关键
-    const store = getStore(name);
+    // 用对象形式传 consistency，把一致性设成整个 Store 的默认值
+    // （SDK 内部默认是 "eventual"，会导致「刚写完读不到」）。
+    // 命名空间名非法时这里会抛 INVALID_STORE_NAME，正好被下面的 catch 收住。
+    let store;
+    try {
+      store = getStore({ name: name, consistency: consistency });
+    } catch (e) {
+      // PagesBlobError 一定带 code；老版本 SDK 不认识对象形式时抛的是 TypeError（无 code）。
+      // 用这个区分「版本不兼容」和「真实的配置/凭证错误」，避免把后者伪装成前者。
+      if (e && e.code) throw e;
+      store = getStore(name);
+    }
     if (!store || typeof store.set !== 'function' || typeof store.list !== 'function') {
       lastBlobError = 'getStore 返回的对象不是预期的 Store';
       return null;
     }
     lastBlobError = '';
-    return { store: makeBlobBackend(store), name: 'blob:' + name };
+    lastConsistency = consistency;
+    return { store: makeBlobBackend(store, { consistency }), name: 'blob:' + name };
   } catch (e) {
-    lastBlobError = 'getStore 调用失败：' + (e && e.message ? e.message : String(e));
+    lastBlobError = 'getStore 调用失败：' + errText(e)
+      + (hintForCode(e && e.code) ? ' —— ' + hintForCode(e && e.code) : '');
     return null;
   }
 }
@@ -272,6 +281,79 @@ async function resolveStore(context, env) {
   return cachedStore;
 }
 
+// ============ 自动创建命名空间 ============
+// getStore() 只是拿到一个句柄，真正的命名空间创建是**首次写入时**由平台完成的。
+// 这有两个问题：创建失败会伪装成「某次聊天保存失败」，而且创建本身要花时间在关键路径上。
+// 所以这里在首个请求时异步跑一次「写标记 → 读回校验」：
+//   - 不阻塞当前响应（交给 waitUntil 托管）
+//   - 把结果缓存在 isolate 里，/healthz 的 debug.provision 直接能看到
+//   - 写进去的 __meta__/provision.json 在控制台可见，等于给命名空间盖了个「本项目在用」的戳
+// 用 BLOB_AUTOPROVISION=0 可以关掉（例如你不想让冷启动产生任何写操作）。
+function ensureProvisioned(env, ctx, store) {
+  if (!store) return;
+  const enabled = String((env && env.BLOB_AUTOPROVISION) || '1') !== '0';
+  if (!enabled) {
+    if (provisionState.state === 'idle') {
+      provisionState = { state: 'disabled', ok: false, at: 0, namespace: '', error: '' };
+    }
+    return;
+  }
+  if (provisionInFlight) return;
+  if (provisionState.state === 'ready') return;
+  if (provisionState.state === 'failed' && Date.now() - provisionLastAttempt < PROVISION_RETRY_MS) return;
+
+  const namespace = String((env && env.EO_BLOB_NAMESPACE) || DEFAULT_BLOB_NAMESPACE);
+  provisionLastAttempt = Date.now();
+  provisionState = { state: 'pending', ok: false, at: provisionLastAttempt, namespace: namespace, error: '' };
+
+  provisionInFlight = (async () => {
+    try {
+      const meta = {
+        namespace: namespace,
+        project: 'cloudflare-chat-edgeone',
+        runtime: 'edgeone-cloud-functions',
+        provisioned_at: new Date().toISOString(),
+      };
+      if (typeof store.__markProvisioned === 'function') {
+        await store.__markProvisioned(meta);
+      } else {
+        await store.put(PROVISION_KEY, JSON.stringify(meta));
+      }
+      // 写完立刻读回：只有读得回来才算「创建并可用」，否则只是「调用没报错」
+      const back = await store.get(PROVISION_KEY);
+      const ok = !!back;
+      provisionState = {
+        state: ok ? 'ready' : 'failed',
+        ok: ok,
+        at: Date.now(),
+        namespace: namespace,
+        error: ok ? '' : '写入成功但读不回来（一致性或权限问题）',
+      };
+    } catch (e) {
+      provisionState = {
+        state: 'failed',
+        ok: false,
+        at: Date.now(),
+        namespace: namespace,
+        error: errText(e) + (hintForCode(e && e.code) ? ' —— ' + hintForCode(e && e.code) : ''),
+      };
+    } finally {
+      provisionInFlight = null;
+    }
+  })();
+
+  // 交给平台托管，避免响应结束后实例被回收、写入被截断
+  try {
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(provisionInFlight.catch(function () {}));
+    } else {
+      provisionInFlight.catch(function () {});
+    }
+  } catch (e) {
+    provisionInFlight.catch(function () {});
+  }
+}
+
 // 当前生效的存储后端名（供 /healthz 显示）
 function activeBackendName() {
   return cachedBackendName;
@@ -281,38 +363,35 @@ function activeBackendName() {
 function storageDiagnostics(context, env) {
   const mode = String((env && env.STORAGE_BACKEND) || 'blob').trim().toLowerCase() || 'blob';
   const known = mode === 'blob' || mode === 'kv' || mode === 'auto' || mode === 'none';
+  const err = blobLastError();
   return {
     backend: cachedBackendName || 'memory',
     mode: mode,
     namespace: String((env && env.EO_BLOB_NAMESPACE) || DEFAULT_BLOB_NAMESPACE),
+    consistency: lastConsistency || normalizeConsistency(env && env.BLOB_CONSISTENCY),
+    provision: {
+      state: provisionState.state,
+      ok: provisionState.ok,
+      at: provisionState.at || null,
+      namespace: provisionState.namespace || null,
+      error: provisionState.error || null,
+    },
     blobError: lastBlobError || null,
     blobBindingUsed: lastBlobFound || null,
     kvBindingUsed: lastKvFound || null,
-    blobCandidates: listBlobCandidates(context, env),
+    // 最近一次存储读写错误。上层大多把异常当成「读不到」处理，
+    // 于是「配额满了」会伪装成「知识库是空的」—— 这里把它摊开。
+    lastStorageError: err
+      ? { op: err.op, code: err.code, message: err.message, at: err.at, hint: hintForCode(err.code) }
+      : null,
     kvCandidates: listKvCandidates(context, env),
     ...(known ? {} : { warning: 'STORAGE_BACKEND 取值无法识别（' + mode + '），已按默认后端 blob 处理' }),
     hint: cachedBackendName
       ? ''
-      : 'Blob 会自动创建命名空间、无需控制台操作。若 blobError 提示找不到 @edgeone/pages-blob，'
-        + '说明依赖没装上（安装命令需为 npm install）；跑在 Edge Functions 上的话 Blob 的 Node.js SDK 不可用，'
-        + '需改用 STORAGE_BACKEND=kv 并在控制台绑定 KV 命名空间。',
+      : 'Blob 会自动创建命名空间、无需控制台操作（Blob 也没有「绑定」这一步，控制台只读）。'
+        + '若 blobError 提示找不到 @edgeone/pages-blob，说明依赖没装上（安装命令需为 npm install）；'
+        + '跑在 Edge Functions 上的话 Blob 的 Node.js SDK 不可用，需改用 STORAGE_BACKEND=kv 并在控制台绑定 KV 命名空间。',
   };
-}
-
-// 列出所有「像 Blob Store」的绑定名，仅用于排障输出
-function listBlobCandidates(context, env) {
-  const out = [];
-  for (const s of collectSources(context, env)) {
-    let keys;
-    try { keys = Object.getOwnPropertyNames(s.obj); } catch (e) { continue; }
-    for (const k of keys) {
-      if (SCAN_SKIP.has(k)) continue;
-      let v;
-      try { v = s.obj[k]; } catch (e) { continue; }
-      if (looksLikeBlobStore(v)) out.push(s.label + '.' + k);
-    }
-  }
-  return out;
 }
 
 // 真实读写一次，确认存储不只是「SDK 加载成功」而是「真的能写能读」。
@@ -328,8 +407,13 @@ async function probeStore() {
     const ok = await cachedStore.__probe();
     return { ok: !!ok, backend: cachedBackendName };
   } catch (e) {
-    return { ok: false, backend: cachedBackendName, reason: e && e.message ? e.message : String(e) };
+    return { ok: false, backend: cachedBackendName, reason: errText(e) };
   }
+}
+
+// 仅供自检脚本使用：等待「自动创建命名空间」这件事落定
+function __awaitProvision() {
+  return provisionInFlight || Promise.resolve();
 }
 
 // 仅供自检脚本使用：清空 isolate 级缓存与探测记录
@@ -340,18 +424,25 @@ function __resetForTest() {
   lastBlobError = '';
   lastBlobFound = '';
   lastKvFound = '';
+  lastConsistency = '';
+  provisionState = { state: 'idle', ok: false, at: 0, namespace: '', error: '' };
+  provisionInFlight = null;
+  provisionLastAttempt = 0;
 }
 
 export {
   resolveStore,
+  ensureProvisioned,
   activeBackendName,
   storageDiagnostics,
   probeStore,
   detectKvBinding,
   detectBlobBinding,
   listKvCandidates,
-  listBlobCandidates,
   looksLikeKvNamespace,
   looksLikeBlobStore,
+  __awaitProvision,
   __resetForTest,
+  DEFAULT_BLOB_NAMESPACE,
+  PROVISION_KEY,
 };
