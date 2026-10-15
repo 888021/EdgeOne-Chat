@@ -11,6 +11,7 @@ import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '.
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
 import { toolListDocs } from '../kb/doc-tools.js';
+import { tgNote } from './diag.js';
 
 // 全局内存缓存（L1 缓存，带 60s TTL）
 const tgUserModels = new Map();
@@ -127,9 +128,16 @@ function uint8ToBase64(bytes) {
 }
 
 export async function handleTgWebhook(request, env) {
+  tgNote('hit', { reason: 'webhook_hit' });
   if (env.TG_WEBHOOK_SECRET) {
     const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
     if (!safeEqual(got, env.TG_WEBHOOK_SECRET)) {
+      // 这是「setWebhook 报成功、机器人却不理人」的第二大根因：
+      // 改了 TG_WEBHOOK_SECRET 却没重新 setWebhook，Telegram 发的还是旧 secret。
+      tgNote('forbidden', {
+        reason: 'secret_mismatch',
+        detail: '收到 secret 长度 ' + got.length + '（空=' + (got === '') + '），期望长度 ' + String(env.TG_WEBHOOK_SECRET).length,
+      });
       return new Response('Forbidden', { status: 403 });
     }
   } else if (env.TG_BOT_TOKEN && !warnedNoWebhookSecret) {
@@ -139,7 +147,10 @@ export async function handleTgWebhook(request, env) {
 
   try {
     const update = await request.json();
-    if (!env.TG_BOT_TOKEN) return new Response('OK', { status: 200 });
+    if (!env.TG_BOT_TOKEN) {
+      tgNote('skip', { reason: 'no_bot_token', detail: '函数读不到 TG_BOT_TOKEN，无法调用 Telegram API' });
+      return new Response('OK', { status: 200 });
+    }
 
     let tgApiTimeoutMs = parseInt(env.TG_API_TIMEOUT_MS || '15000', 10);
     if (!(tgApiTimeoutMs > 0)) tgApiTimeoutMs = 15000;
@@ -154,7 +165,12 @@ export async function handleTgWebhook(request, env) {
       let pendingCleanup = null;
       try {
         const { models: modelObjList } = getChannelConfig(env);
-        if (modelObjList.length === 0) return;
+        if (modelObjList.length === 0) {
+          // 静默失败的头号源头：没有解析出模型 → 直接 return → 机器人完全不说话，
+          // 而 Telegram 侧收到的是 200 OK，从任何地方都看不出异常。
+          tgNote('skip', { reason: 'no_models', updateId: update.update_id, detail: 'getChannelConfig 解析出 0 个模型' });
+          return;
+        }
 
         const allowedChatIds = parseCommaSeparated(env.TG_ALLOWED_CHAT_IDS);
         const isChatAllowed = (cid) => !allowedChatIds.length || allowedChatIds.indexOf(String(cid)) !== -1;
@@ -163,6 +179,12 @@ export async function handleTgWebhook(request, env) {
           const cb = update.callback_query;
           const chatId = cb.message && cb.message.chat ? cb.message.chat.id : undefined;
           if (chatId === undefined || !isChatAllowed(chatId)) {
+            tgNote('skip', {
+              reason: 'callback_chat_not_allowed',
+              updateId: update.update_id,
+              chatId: chatId === undefined ? null : chatId,
+              detail: '按钮回调来自未授权会话，白名单是 [' + allowedChatIds.join(',') + ']',
+            });
             try { await tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {}); } catch (e) {}
             return;
           }
@@ -189,9 +211,28 @@ export async function handleTgWebhook(request, env) {
         }
 
         const msg = update.message;
-        if (!msg || !msg.chat) return;
+        if (!msg || !msg.chat) {
+          const kinds = Object.keys(update).filter(k => k !== 'update_id');
+          tgNote('skip', {
+            reason: 'not_a_message',
+            updateId: update.update_id,
+            detail: '更新里没有 message 字段，实际携带的是：' + (kinds.join(',') || '(空)'),
+          });
+          return;
+        }
         const chatId = msg.chat.id;
-        if (!isChatAllowed(chatId)) return;
+        if (!isChatAllowed(chatId)) {
+          // 把真实 chat_id 原样记下来：这是「机器人没反应」最高频的根因，
+          // 用户只要把它复制进 TG_ALLOWED_CHAT_IDS 就能修好，不用去别处找。
+          tgNote('skip', {
+            reason: 'chat_not_allowed',
+            updateId: update.update_id,
+            chatId: chatId,
+            chatType: msg.chat.type,
+            detail: '白名单是 [' + allowedChatIds.join(',') + ']，本会话是 ' + chatId,
+          });
+          return;
+        }
 
         // 提取消息内容：支持纯文本、文本文档直传（.md/.txt/.csv/.json/代码）、图片（Vision 多模态）
         let userText = typeof msg.text === 'string' ? msg.text : '';
@@ -245,6 +286,9 @@ export async function handleTgWebhook(request, env) {
 
         if (userText) {
           const cmd = !multimodalContent ? parseCommand(userText) : null;
+          if (cmd) {
+            tgNote('ok', { reason: 'command', updateId: update.update_id, chatId: chatId, cmd: cmd.cmd });
+          }
           if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
             const inline_keyboard = modelObjList.map((model, index) => {
               return [{ text: model.name, callback_data: `M:${index}` }];
@@ -496,6 +540,7 @@ export async function handleTgWebhook(request, env) {
           }
 
           if (agentErr) {
+            tgNote('ok', { reason: 'replied_error', updateId: update.update_id, chatId: chatId, detail: String(agentErr).slice(0, 200) });
             await tgApi('sendMessage', { chat_id: chatId, text: agentErr });
             return;
           }
@@ -516,12 +561,21 @@ export async function handleTgWebhook(request, env) {
               return { ok: false };
             };
             const chunks = splitTelegramMarkdown(replyText, 3980);
+            let delivered = 0;
             for (const chunk of chunks) {
               const tgRes = await sendReplyChunk(chunk, true);
               if (!tgRes.ok) {
                 await sendReplyChunk(chunk, false);
+              } else {
+                delivered++;
               }
             }
+            tgNote('ok', {
+              reason: 'replied',
+              updateId: update.update_id,
+              chatId: chatId,
+              detail: '回复 ' + replyText.length + ' 字符，分 ' + chunks.length + ' 条，成功投递 ' + delivered + ' 条',
+            });
           }
         }
       } catch (err) {
@@ -533,6 +587,7 @@ export async function handleTgWebhook(request, env) {
 
     const uid = update && update.update_id;
     if (uid !== undefined && uid !== null && await markUpdateSeen(env, uid)) {
+      tgNote('dedup', { reason: 'duplicate_update', updateId: uid, detail: '该 update_id 已处理过，直接丢弃' });
       return new Response('OK', { status: 200 });
     }
 
@@ -540,11 +595,13 @@ export async function handleTgWebhook(request, env) {
       await processTelegramUpdate(env, update, tgApi);
     } catch (err) {
       await releaseUpdateForRetry(env, uid);
+      tgNote('error', { reason: 'process_error', updateId: uid, detail: String((err && err.message) || err) });
       console.log("处理 Telegram 更新异常:", err);
     }
 
     return new Response('OK', { status: 200 });
   } catch (error) {
+    tgNote('error', { reason: 'bad_json_or_fatal', detail: String((error && error.message) || error) });
     return new Response('Error', { status: 500 });
   }
 }

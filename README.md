@@ -34,7 +34,7 @@ edgeone-chat/
 ├── package.json                  # 依赖：@edgeone/pages-blob
 ├── tts-demo.html                 # 静态演示页（原样保留）
 ├── scripts/
-│   ├── selfcheck.mjs             # 本地自检：104 项用例，不需要 EdgeOne 环境
+│   ├── selfcheck.mjs             # 本地自检：127 项用例，不需要 EdgeOne 环境
 │   └── bootstrap-blob.mjs        # ★ 部署前预创建 Blob 命名空间（token 模式，可进 CI）
 └── cloud-functions/              # EdgeOne Cloud Functions 路由目录
     ├── index.js                  # 路由：/          （聊天页面）
@@ -48,6 +48,7 @@ edgeone-chat/
         │   ├── blob-backend.js   # ★ R2 API → EdgeOne Blob
         │   └── kv-backend.js     # ★ R2 API → EdgeOne KV（备选）
         ├── agent/ kb/ net/ pwa/ telegram/ ui/ …   # 与原版逐文件对应
+        │   └── telegram/         # handler.js 原样保留；diag.js / setup.js 为新增的自诊断
         └── constants.js auth.js channel.js rate-limit.js utils.js web-agent.js
 ```
 
@@ -77,6 +78,7 @@ edgeone-chat/
 | 13 | `scripts/bootstrap-blob.mjs` | **新增**：用 SDK 的 token 模式在部署前预创建命名空间并验证 | 把命名空间创建从「首个用户请求里」提前到部署时 |
 | 14 | `package.json` | `dev` 脚本改为 `edgeone makers dev`（CLI 命名空间已从 `edgeone pages` 迁移）；新增 `bootstrap:blob` | — |
 | 15 | 全局 | 项目更名 **`cloudflare-chat` → `edgeone-chat`**：包名、`edgeone.json`、页面标题、品牌名、PWA manifest/缓存名、Agent 系统提示、对外 User-Agent、Telegram 日志前缀、Blob 默认命名空间、KV 常见绑定名 | 见第五节「关于改名」。唯一保留的兼容层是**浏览器旧存储键的自动搬迁**（不搬会丢用户聊天记录）。其余旧名兼容（旧 PWA 缓存前缀、旧 KV 绑定名、旧命名空间提示）**均已按要求移除**；`CF-Connecting-IP` 保留，因为那是协议头名不是品牌名 |
+| 16 | `_app/telegram/diag.js`、`_app/telegram/setup.js` | **新增**：`/tg-setup` 自诊断端点 + 进程内事件留痕；`telegram/handler.js` 的每条早退分支都补上 `tgNote()` 留痕 | `setWebhook` 成功 ≠ 链路可用。原实现为了不让 Telegram 重试，几乎全部分支都返回 200，配置错了机器人就**完全静默**，Telegram 与函数日志两头都看不到原因。见第四节第 5 小节 |
 
 **其余 40 个文件（UI、PWA、SSRF 防护、Agent 循环、工具链、Telegram 处理器）均为原样复制。**
 
@@ -126,7 +128,12 @@ Telegram 机器人（可选）：
 TG_BOT_TOKEN         = 从 @BotFather 拿到的 token
 TG_WEBHOOK_SECRET    = openssl rand -hex 24 生成
 TG_ALLOWED_CHAT_IDS  = 你自己的 chat id
+TG_SETUP_KEY         = 自诊断端点的口令（可选；不配则回退用 TG_WEBHOOK_SECRET）
 ```
+
+> **强烈建议先配 `TG_SETUP_KEY`**：配了之后你就有 `/tg-setup` 这个自诊断入口，
+> 机器人不响应时不用盲猜（见第五节）。注意 `TG_ALLOWED_CHAT_IDS` 填错是
+> 「机器人完全没反应」的头号原因，而 `/tg-setup` 会直接把你的真实 chat id 报出来。
 
 设置完成后**重新部署一次**才会生效。完整变量表见原版 README 的「环境变量一览」。
 
@@ -173,9 +180,98 @@ EO_PROJECT_ID=pages-xxxxxxxx EO_API_TOKEN=xxx npm run bootstrap:blob
 
 ### 5. Telegram Webhook（可选）
 
+**推荐做法：用自带的 `/tg-setup` 绑定，而不是手动拼 setWebhook URL。**
+因为它绑完之后会立刻把 `getWebhookInfo` 的结果摊给你看 —— 手动绑只能看到一句
+`{"ok":true,"description":"Webhook was set"}`，而这句话**不代表链路可用**。
+
+```
+https://<你的EdgeOne域名>/tg-setup?key=<TG_SETUP_KEY>&action=set
+```
+
+绑好后同一地址（去掉 `&action=set`）就是体检报告：
+
+```
+https://<你的EdgeOne域名>/tg-setup?key=<TG_SETUP_KEY>
+```
+
+手动绑定（等价，不推荐）：
+
 ```
 https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<你的EdgeOne域名>/tg-webhook&secret_token=<SECRET>
 ```
+
+#### 机器人不响应时，按这个顺序查
+
+`setWebhook` 返回 `ok:true` 只说明**请求被接受**，它不校验你的 URL 真的可达，
+也不校验 `secret_token` 与后端一致。真正的失败信息在 `getWebhookInfo` 里，
+而本项目的 `/tg-webhook` 为了不让 Telegram 无限重试，**绝大多数分支都返回 200 OK**
+—— 于是配置错了机器人就完全静默，两边都看不到错误。`/tg-setup` 就是为了消灭这段静默。
+
+**第 0 步：先确认函数真的部署上去了**
+
+```bash
+curl -s https://<你的域名>/healthz
+# 期望 {"ok":true,...,"storage":"blob:edgeone-chat"}
+```
+
+**第 1 步：直接打一下 webhook，看状态码**（这一步能把「路由问题」和「逻辑问题」分开）
+
+```bash
+curl -i -X POST https://<你的域名>/tg-webhook \
+  -H 'Content-Type: application/json' \
+  -H 'X-Telegram-Bot-Api-Secret-Token: <你的 TG_WEBHOOK_SECRET>' \
+  -d '{"update_id":1}'
+```
+
+| 你看到的 | 含义 |
+|---|---|
+| `200 OK` + body `OK` | 路由与 secret 都正常，问题在后面的业务分支 → 走第 2 步 |
+| `403 Forbidden` | secret 不匹配。要么 `TG_WEBHOOK_SECRET` 改过却没重新 setWebhook，要么请求头没带 |
+| `404 Not Found` | 请求没进函数。检查域名、路径拼写、以及函数是否真的部署成功 |
+| `500 Error` | 请求体解析失败，或函数内部抛错 |
+
+**第 2 步：打开体检报告**
+
+```
+https://<你的域名>/tg-setup?key=<TG_SETUP_KEY>
+```
+
+重点看这四个字段：
+
+| 字段 | 说明 |
+|---|---|
+| `topHint` | **最有用的一项。** 把「最近为什么没反应」直接翻成一句中文，并且会把被白名单拦下的**真实 chat_id** 报出来，复制进 `TG_ALLOWED_CHAT_IDS` 即可 |
+| `webhook.lastErrorMessage` | Telegram 侧记录的最近一次投递失败。`403 Forbidden` = secret 不一致；`Wrong response from the webhook` = 后端返回了非 2xx |
+| `webhook.urlMatches` | 注册的地址是否等于本函数以为的地址。`false` 说明 Telegram 的请求根本没打到这里（自定义域名场景请配 `TG_PUBLIC_BASE_URL`） |
+| `hints[]` | 逐条列出的问题与修法，`level: fatal` 的就是当前拦路的那条 |
+
+`/tg-setup` 的完整能力：
+
+| 调用 | 作用 |
+|---|---|
+| `/tg-setup?key=K` | 体检报告（`getMe` + `getWebhookInfo` + 本地配置 + 进程内事件） |
+| `/tg-setup?key=K&action=set` | 绑定 webhook（自动带上 `secret_token` 与 `allowed_updates`） |
+| `/tg-setup?key=K&action=set&drop=1` | 绑定并**丢弃积压更新**，避免修好后旧消息被一次性补发 |
+| `/tg-setup?key=K&action=delete` | 解绑 webhook |
+| `/tg-setup?key=K&action=test` | 往白名单第一个会话发一条连通性自检消息 |
+| `/tg-setup?key=K&action=diag` | 只看进程内事件（等价于报告里的 `diag` 字段） |
+
+**第 3 步：对照高频根因**
+
+| 症状 / 报告里的线索 | 根因与修法 |
+|---|---|
+| `topHint.code = chat_not_allowed` | **头号原因。** 消息被 `TG_ALLOWED_CHAT_IDS` 拦下。报告里会给出真实 chat_id，填进去即可。注意**群聊的 chat id 是负数**，用你的个人 user id 是不匹配的 |
+| `hints` 里有 `no_models` | 没有解析到模型，Telegram 分支拿到更新后第一步就 `return` 了。请在**同一个环境**里配 `API_URL_1 / API_KEY_1 / MODEL_1`（或 `API_URL / API_KEY / MODEL`） |
+| `hints` 里有 `no_bot_token` | 函数读不到 `TG_BOT_TOKEN`。确认它配在 Cloud Functions 的环境变量里，而不是只写在本地 `.env` |
+| `lastErrorMessage` 含 `403 Forbidden` | `TG_WEBHOOK_SECRET` 改过但没重新 `setWebhook`，Telegram 发的还是旧 secret。重跑 `action=set` 让两边对齐 |
+| `urlMatches = false` | 注册地址 ≠ 实际地址。自定义域名/反代场景请配 `TG_PUBLIC_BASE_URL` 后重跑 `action=set` |
+| `pendingUpdateCount > 0` | 更新在堆积但投递失败。修好根因后用 `action=set&drop=1` 清掉积压 |
+| `hints` 里有 `tg_unreachable` | 函数出网到 `api.telegram.org` 不通。这是网络层面的问题，需要反代或换部署区域 |
+| 报告正常但机器人仍不回 | 看 `diag.events` 里最近几条的 `reason`；若 `counters.received = 0`，说明请求压根没到函数，回到第 1 步 |
+
+> `diag` 是**进程内（L1）观测**：Cloud Functions 会扩缩容与实例复用，所以它只反映
+> 「处理这个诊断请求的那个实例」看到的事件。多数情况下这恰好就是你想看的那个实例，
+> 但要跨实例看全量请用 Makers 控制台的日志。
 
 ---
 
@@ -262,6 +358,10 @@ Blob Store（用 `set`）区分开，并显式排除本层自己挂载的 `env.R
 | `EO_BLOB_BINDING` | 字符串 | 不填 | 逃生口：注入自建 Store 实例（一般不需要） |
 | `EO_KV_BINDING` | 字符串 | 不填即自动发现 | 仅 `STORAGE_BACKEND=kv` 时有意义 |
 | `STORAGE_DEBUG` | `1` | 不输出 | 设为 `1` 后 `/healthz` 附带后端探测详情；再加 `?probe=1` 会真实读写一次 |
+| `TG_SETUP_KEY` | 字符串 | 不填 | `/tg-setup` 自诊断端点的口令。不填时回退用 `TG_WEBHOOK_SECRET`；两者都没有则端点**关闭**（防止外人改你的 webhook） |
+| `TG_PUBLIC_BASE_URL` | 形如 `https://chat.example.com` | 不填即用请求 origin | 自定义域名 / 反向代理场景下，用于推导要注册的 webhook 地址。不填时 `urlMatches` 可能误报不一致 |
+| `TG_API_TIMEOUT_MS` | 整数 | `15000` | 调用 Telegram API 的超时 |
+| `TG_WEBHOOK_BUDGET_MS` | 整数（≥10000，≤240000） | `55000` | 单次 webhook 内 Agent 循环的时间预算。Cloud Functions 上限 120s，留足余量 |
 
 ### 为什么 `BLOB_CONSISTENCY` 默认是 `strong`
 
@@ -432,6 +532,12 @@ IMAGE_WATERMARK = false
 7. **免费版单账户 Blob 容量 1GB**。按 2K PNG 约 3MB 估算约 300 张图，或约 100 万字的 Markdown。
    超限时 SDK 抛 `QUOTA_EXCEEDED`，本项目会把它记录到 `/healthz` 的
    `debug.lastStorageError`（否则会伪装成「知识库是空的」）。
+8. **Telegram 处理出错时仍返回 200，而不是 500**。这是原版就有的取舍，本项目**沿用了它**：
+   返回 500 会让 Telegram 按退避策略反复重投同一条更新，一旦有持久性 bug 就会变成
+   对函数的持续捶打（最长约 24 小时）。代价是**更新会被永久丢弃**。
+   所以本项目没有改这个行为，而是补上**可观测性**——出错时 `tgNote('error')` 会记下
+   `reason` 与错误详情，通过 `/tg-setup` 的 `diag.lastError` 与 `diag.events` 摊开。
+   唯一的例外是**请求体不是合法 JSON**：这种情况确定是调用方问题，返回 500 让 Telegram 重试是安全的。
 6. **`_app/` 目录不参与路由**依赖平台对下划线前缀的忽略规则。即使平台为它生成了路由，
    也只会让 `/_app/xxx` 这类路径返回错误，不影响正常功能。
 7. **生图转存会占用存储**。默认 `IMAGE_PERSIST=1`，每张图约占 1~3 MB（取决于分辨率），
@@ -450,7 +556,7 @@ IMAGE_WATERMARK = false
 node scripts/selfcheck.mjs      # 或 npm run selfcheck
 ```
 
-覆盖 104 项用例，包括：
+覆盖 127 项用例，包括：
 
 - 完整模块图能否加载（能捕获所有语法/导入错误）
 - R2 契约在两个后端上的一致性：`put`/`get`/`get+range`/批量 `delete`/`list` 的
@@ -482,12 +588,20 @@ node scripts/selfcheck.mjs      # 或 npm run selfcheck
   防止模板字符串两层转义把前端写坏（这类错误服务端完全看不出来）
 - **品牌名改名**：页面标题/品牌名/PWA meta/manifest 都已是 `EdgeOne-Chat`、
   Service Worker 用新缓存名、Agent 系统提示与对外 User-Agent 已改名、
-  存储默认命名空间已切换。另有一条**源码级兜底断言**：13 个关键文件里都不允许再出现
+  存储默认命名空间已切换。另有一条**源码级兜底断言**：15 个关键文件里都不允许再出现
   `cloudflare`（不分大小写），防止以后手滑把旧名带回来
 - **浏览器端键名迁移（行为级测试）**：从渲染出的页面里**切出真实代码片段**跑，
   不复制逻辑。覆盖 `cfchat_sessions` / `nvidia_ai_sessions` → `eochat_sessions` 的两级搬迁、
   新旧键并存时以新键为准、全新用户不凭空写入、旧键内容损坏时降级为空而非崩溃、
   Agent 开关的继承与优先级
+- **Telegram 链路自诊断**：`/tg-setup` 未配 key 时关闭、key 错返回 403、
+  `getWebhookInfo.last_error_message` 被翻出来、注册地址不一致报 `url_mismatch`、
+  自定义域名用 `TG_PUBLIC_BASE_URL` 覆盖、`action=set` 带上 `secret_token` 与 `allowed_updates`、
+  **响应里绝不回显 bot token 原文**（只回 `bot_id` 与密钥长度）、出网失败给 `tg_unreachable`、
+  无模型时记录 `no_models` 且**对 Telegram 仍返回 200**（把静默契约钉死成断言）、
+  白名单拦下时**记录真实 chat_id** 并转成可执行提示、secret 不匹配返回 403 且留痕、
+  非消息类更新识别为 `not_a_message`、请求体非 JSON 返回 500 并留痕、
+  `action=test` 往白名单第一个会话发消息、白名单为空时拒绝瞎猜
 - **端到端**：挂上存储后端后，长期记忆写入/读回/md 镜像、同主题改口覆盖、
   知识库中文标题保存/列表/精读/删除/分词检索——**两个后端各跑一遍**
 
@@ -517,7 +631,7 @@ edgeone makers dev
 | 想用 KV 但 `storage` 一直是 `memory` | KV 需要三步且都不可省：控制台开通 KV 账户 → 创建命名空间 → 绑定到项目。另注意 **KV 仅 Edge Functions 可用**，跑在 Cloud Functions 上的项目用不了 KV（本项目默认就是 Cloud Functions，建议直接用 Blob）。另外默认后端是 Blob，**不会自动退到 KV**，要显式设 `STORAGE_BACKEND=kv` |
 | KV 绑定名不想用 `CHAT_KV` | 不用改，任意绑定名都能被自动发现。设 `STORAGE_DEBUG=1` 后看 `debug.kvCandidates` 确认是否扫到了 |
 | 页面提示「未配置模型」 | 环境变量没配或配完没重新部署。注意 `MODEL_1` 的格式是 `模型ID:显示名`，多个用英文逗号分隔 |
-| 聊天正常，但 Telegram 机器人不响应 | webhook 没设、`TG_ALLOWED_CHAT_IDS` 没加你的 chat id、或 `TG_WEBHOOK_SECRET` 与 `setWebhook` 时不一致 |
+| 聊天正常，但 Telegram 机器人不响应 | **先打开 `/tg-setup?key=<TG_SETUP_KEY>` 看 `topHint` 与 `hints`**，它会直接告诉你是哪一条。最高频的三个原因：`TG_ALLOWED_CHAT_IDS` 没加你的 chat id（报告会给出真实 chat_id）、没解析出模型（`no_models`）、`TG_WEBHOOK_SECRET` 与注册时不一致（报告里 `lastErrorMessage` 会写 `403 Forbidden`）。完整排查顺序见第四节第 5 小节 |
 | Agent 长任务中途中断 | `maxDuration` 被改小了。保持 `edgeone.json` 里 `cloudFunctions.nodejs.maxDuration = 120`，并确认 `WEB_AGENT_TIMEOUT_MS` ≤ 120000 |
 | 知识库文档列表体积都显示 1 KB | 预期行为，见「已知限制」第 1 条 |
 | 生图提示「图像接口未返回任何图片。原始响应：…」 | 上游返回结构不在兼容范围内。看提示里的原始响应片段，若图片藏在别的字段，按第六节的三种形态补一条分支 |
@@ -537,3 +651,6 @@ edgeone makers dev
 
 部署完成后请依次访问 `/healthz`、`/manifest.webmanifest`、`/icon-192.png` 确认兜底路由生效。
 如果其中任何一个返回 404 而 `/` 正常，参考上表最后一行的处理方式。
+
+用到 Telegram 的话，再确认一条：`POST /tg-webhook` 能返回 200 而不是 404
+（命令见第四节第 5 小节的第 1 步）。`/tg-setup` 同样走兜底路由，返回 403 就说明路由是通的。

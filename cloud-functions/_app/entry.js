@@ -5,7 +5,8 @@
 //   1) 存储：env.R2 由 store/edge-store.js 注入（EdgeOne Blob 或 KV 的 R2 兼容替身）；
 //   2) 客户端 IP：rate-limit.js 增加了 EO-Connecting-IP 等头名；
 //   3) 配置缓存：channel.js 的模型配置缓存加了 env 签名，避免多实例下串配置；
-//   4) /healthz 额外返回当前生效的存储后端，便于线上排障。
+//   4) /healthz 额外返回当前生效的存储后端，便于线上排障；
+//   5) 新增 /tg-setup 自诊断端点，把 Telegram 的静默失败翻成可读原因。
 
 import { CORS_HEADERS, TEXT_HEADERS, HTML_HEADERS, SSE_HEADERS, PNG_HEADERS,
   MANIFEST_HEADERS, SW_HEADERS, HEALTH_HEADERS, APP_VERSION, imgHeaders } from './constants.js';
@@ -15,6 +16,7 @@ import { getChannelConfig, buildAIRequest } from './channel.js';
 import { readErrorBody } from './agent/stability.js';
 import { handleWebAgent } from './web-agent.js';
 import { handleTgWebhook } from './telegram/handler.js';
+import { handleTgSetup } from './telegram/setup.js';
 import { ICON_B64, getIconBytes } from './pwa/icons.js';
 import { MANIFEST_JSON } from './pwa/manifest.js';
 import { SW_JS } from './pwa/service-worker.js';
@@ -199,6 +201,14 @@ async function routeRequest(request, env, ctx) {
     // Telegram Bot Webhook：命令、Agent 对话与回复发送都在该模块内处理
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       return await handleTgWebhook(request, env);
+    }
+
+    // Telegram 自诊断 / 一键绑定 webhook（需 TG_SETUP_KEY，回退 TG_WEBHOOK_SECRET）。
+    // 存在的理由：setWebhook 返回 ok 只代表「请求被接受」，不代表链路可用 ——
+    // 真正的失败信息藏在 getWebhookInfo().last_error_message 里。这个端点把它
+    // 连同本地配置快照与进程内事件一起摊开，省掉「盲猜 + 反复重部署」。
+    if ((request.method === 'GET' || request.method === 'POST') && url.pathname === '/tg-setup') {
+      return await handleTgSetup(request, env, url);
     }
 
     return new Response('Not Found', { status: 404 });

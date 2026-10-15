@@ -1087,6 +1087,8 @@ async function main() {
       'cloud-functions/_app/agent/tools-local.js',
       'cloud-functions/_app/agent/tools-web.js',
       'cloud-functions/_app/telegram/handler.js',
+      'cloud-functions/_app/telegram/diag.js',
+      'cloud-functions/_app/telegram/setup.js',
       'cloud-functions/_app/ui/head.js',
       'cloud-functions/_app/ui/body.js',
       'cloud-functions/_app/ui/app-state.js',
@@ -1252,6 +1254,381 @@ async function main() {
     const r = runAgentModeScript({ eochat_agent_mode: '0', cfchat_agent_mode: '1' });
     assert.equal(r.out.agentMode, false);
     assert.equal(r.ls.getItem('cfchat_agent_mode'), '1', '新键已存在时不该去动旧键');
+  });
+
+  console.log('\n=== 12. Telegram 链路自诊断（把静默失败翻成可读原因） ===');
+
+  const diag = await import('../cloud-functions/_app/telegram/diag.js');
+  const origFetch = globalThis.fetch;
+
+  // 伪 Telegram API：按方法名返回预设响应，并记录每次调用，便于断言「到底发了什么」
+  function stubTelegramFetch(opts) {
+    const o = opts || {};
+    const calls = [];
+    globalThis.fetch = async (url, init) => {
+      const u = String(url);
+      const method = u.split('/').pop().split('?')[0];
+      calls.push({ method: method, init: init, url: u });
+      let body;
+      if (method === 'getMe') body = o.me || { ok: true, result: { id: 12345, is_bot: true, username: 'my_test_bot' } };
+      else if (method === 'getWebhookInfo') body = o.info || { ok: true, result: { url: '', pending_update_count: 0 } };
+      else if (method === 'setWebhook') body = { ok: true, result: true, description: 'Webhook was set' };
+      else if (method === 'sendMessage') body = { ok: true, result: { message_id: 1 } };
+      else body = { ok: false, error_code: 404, description: 'Not Found' };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+    return calls;
+  }
+  function restoreFetch() { globalThis.fetch = origFetch; }
+
+  const FAKE_TOKEN = '123456789:AAFakeSecretTokenValueThatShouldNeverLeak012345';
+  const TG_MODELS = { API_URL: 'https://up.example/v1/chat/completions', MODEL: 'm1', API_KEY: 'k1' };
+
+  function tgWebhookCall(env, update, headers) {
+    return mod.handle({
+      request: new Request('https://example.com/tg-webhook', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}),
+        body: JSON.stringify(update),
+      }),
+      env: env,
+      waitUntil: () => {},
+    });
+  }
+  function tgSetupCall(qs, env) {
+    return mod.handle({
+      request: new Request('https://example.com/tg-setup' + qs),
+      env: env,
+      waitUntil: () => {},
+    });
+  }
+
+  await checkAsync('diag 模块可加载，且快照结构完整', () => {
+    diag.tgReset();
+    const ev = diag.tgNote('skip', { reason: 'unit_test', chatId: 42 });
+    assert.equal(ev.reason, 'unit_test');
+    const snap = diag.tgSnapshot();
+    assert.equal(snap.counters.skipped, 1);
+    assert.equal(snap.events.length, 1);
+    assert.equal(snap.events[0].chatId, 42);
+    assert.ok(snap.startedAt && snap.now);
+    diag.tgReset();
+    assert.equal(diag.tgSnapshot().counters.skipped, 0, 'tgReset 应清空状态');
+  });
+
+  await checkAsync('/tg-setup 在未配置任何 key 时直接关闭（否则任何人都能改你的 webhook）', async () => {
+    const res = await tgSetupCall('', { STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN });
+    assert.equal(res.status, 403);
+    const j = await res.json();
+    assert.equal(j.ok, false);
+    assert.match(j.error, /TG_SETUP_KEY/);
+  });
+
+  await checkAsync('/tg-setup key 不正确时返回 403', async () => {
+    const res = await tgSetupCall('?key=wrong', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'right' });
+    assert.equal(res.status, 403);
+    assert.match((await res.json()).error, /key 不正确/);
+  });
+
+  await checkAsync('/tg-setup 读不到 TG_BOT_TOKEN 时明确报出来，并带上进程内事件', async () => {
+    diag.tgReset();
+    diag.tgNote('skip', { reason: 'no_bot_token' });
+    const res = await tgSetupCall('?key=k', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k' });
+    assert.equal(res.status, 200);
+    const j = await res.json();
+    assert.equal(j.ok, false);
+    assert.match(j.error, /TG_BOT_TOKEN/);
+    assert.equal(j.diag.counters.skipped, 1, '应附带进程内观测');
+    assert.equal(j.topHint.code, 'no_bot_token');
+    diag.tgReset();
+  });
+
+  await checkAsync('/tg-setup 把 getWebhookInfo 的 last_error_message 翻出来（setWebhook 成功 ≠ 链路可用）', async () => {
+    const calls = stubTelegramFetch({
+      info: {
+        ok: true,
+        result: {
+          url: 'https://example.com/tg-webhook',
+          pending_update_count: 7,
+          last_error_date: 1700000000,
+          last_error_message: 'Wrong response from the webhook: 403 Forbidden',
+        },
+      },
+    });
+    try {
+      const res = await tgSetupCall('?key=k', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN });
+      const j = await res.json();
+      assert.equal(j.webhook.urlMatches, true);
+      assert.equal(j.webhook.pendingUpdateCount, 7);
+      assert.match(j.webhook.lastErrorMessage, /403 Forbidden/);
+      assert.equal(j.healthy, false, '有投递错误时不应报健康');
+      const codes = j.hints.map(h => h.code);
+      assert.ok(codes.includes('last_error'), '应给出投递失败提示');
+      assert.ok(codes.includes('pending_updates'), '积压更新也应提示');
+      assert.ok(calls.some(c => c.method === 'getMe'), '应调用 getMe');
+      assert.ok(calls.some(c => c.method === 'getWebhookInfo'), '应调用 getWebhookInfo');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('注册地址与预期不一致时报 url_mismatch（Telegram 的请求根本没打到这里）', async () => {
+    stubTelegramFetch({ info: { ok: true, result: { url: 'https://old-domain.example/tg-webhook', pending_update_count: 0 } } });
+    try {
+      const res = await tgSetupCall('?key=k', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN });
+      const j = await res.json();
+      assert.equal(j.webhook.urlMatches, false);
+      assert.equal(j.webhook.expectedUrl, 'https://example.com/tg-webhook');
+      const mismatch = j.hints.find(h => h.code === 'url_mismatch');
+      assert.ok(mismatch, '应给出 url_mismatch');
+      assert.equal(mismatch.level, 'fatal');
+      assert.match(mismatch.message, /old-domain\.example/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('自定义域名场景：TG_PUBLIC_BASE_URL 覆盖推导出的地址', async () => {
+    stubTelegramFetch({ info: { ok: true, result: { url: 'https://chat.my.domain/tg-webhook', pending_update_count: 0 } } });
+    try {
+      const res = await tgSetupCall('?key=k', {
+        STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN,
+        TG_PUBLIC_BASE_URL: 'https://chat.my.domain/',
+      });
+      const j = await res.json();
+      assert.equal(j.base, 'https://chat.my.domain', '尾部斜杠应被归一化');
+      assert.equal(j.usingCustomBase, true);
+      assert.equal(j.webhook.urlMatches, true, '用了自定义域名就不该误报不一致');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('action=set 会把 secret_token 与 allowed_updates 一起带上，并如实报告是否发送了 secret', async () => {
+    const calls = stubTelegramFetch({});
+    try {
+      const res = await tgSetupCall('?key=k&action=set', {
+        STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN,
+        TG_WEBHOOK_SECRET: 'abcdef0123456789',
+      });
+      const j = await res.json();
+      assert.equal(j.setWebhook.ok, true);
+      assert.equal(j.setWebhook.sentSecretToken, true);
+      assert.equal(j.setWebhook.sentSecretLength, 16);
+      const setCall = calls.find(c => c.method === 'setWebhook');
+      assert.ok(setCall, '应调用 setWebhook');
+      const sent = JSON.parse(setCall.init.body);
+      assert.equal(sent.url, 'https://example.com/tg-webhook');
+      assert.equal(sent.secret_token, 'abcdef0123456789');
+      assert.deepEqual(sent.allowed_updates, ['message', 'callback_query']);
+      assert.equal(sent.drop_pending_updates, false);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('未配置 TG_WEBHOOK_SECRET 时不发送 secret_token，并提示接口处于开放状态', async () => {
+    const calls = stubTelegramFetch({});
+    try {
+      const res = await tgSetupCall('?key=k&action=set', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN });
+      const j = await res.json();
+      assert.equal(j.setWebhook.sentSecretToken, false);
+      const sent = JSON.parse(calls.find(c => c.method === 'setWebhook').init.body);
+      assert.equal('secret_token' in sent, false, '没配就不该发送该字段');
+      assert.ok(j.hints.some(h => h.code === 'no_secret'));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('响应里绝不回显 bot token 原文（只回 bot_id 与密钥长度）', async () => {
+    stubTelegramFetch({});
+    try {
+      const res = await tgSetupCall('?key=k&action=set', {
+        STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN, TG_WEBHOOK_SECRET: 'abcdef0123456789',
+      });
+      const text = await res.text();
+      assert.equal(text.includes(FAKE_TOKEN), false, '绝不能出现完整 token');
+      assert.equal(text.includes('AAFakeSecretTokenValueThatShouldNeverLeak012345'), false, '绝不能出现 token 密钥段');
+      const j = JSON.parse(text);
+      assert.equal(j.bot.botId, '123456789', 'bot_id 可公开，便于核对是不是自己的 bot');
+      assert.equal(j.bot.formatOk, true);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('出网失败（fetch 抛错）时给出 tg_unreachable，而不是含糊的失败', async () => {
+    globalThis.fetch = async () => { throw new Error('fetch failed'); };
+    try {
+      const res = await tgSetupCall('?key=k', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN });
+      const j = await res.json();
+      assert.equal(j.getMe.transportError, 'fetch failed');
+      const h = j.hints.find(x => x.code === 'tg_unreachable');
+      assert.ok(h, '应给出出网不通的提示');
+      assert.equal(h.level, 'fatal');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('没有模型时 webhook 记录 no_models —— 且对 Telegram 仍返回 200（这正是静默的根源）', async () => {
+    diag.tgReset();
+    const res = await tgWebhookCall(
+      { STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN, TG_ALLOWED_CHAT_IDS: '999' },
+      { update_id: 101, message: { message_id: 1, chat: { id: 999, type: 'private' }, text: '你好' } },
+    );
+    assert.equal(res.status, 200, 'Telegram 侧看到的是成功 —— 所以必须靠自诊断才能发现问题');
+    const snap = diag.tgSnapshot();
+    assert.equal(snap.counters.received, 1);
+    assert.equal(snap.counters.skipped, 1);
+    const ev = snap.events.find(e => e.reason === 'no_models');
+    assert.ok(ev, '应记录 no_models');
+    assert.equal(ev.updateId, 101);
+    diag.tgReset();
+  });
+
+  await checkAsync('白名单拦下时记录真实 chat_id —— 用户可以直接复制进 TG_ALLOWED_CHAT_IDS', async () => {
+    diag.tgReset();
+    const res = await tgWebhookCall(
+      Object.assign({ STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN, TG_ALLOWED_CHAT_IDS: '111' }, TG_MODELS),
+      { update_id: 202, message: { message_id: 2, chat: { id: 88888888, type: 'private' }, text: '在吗' } },
+    );
+    assert.equal(res.status, 200);
+    const snap = diag.tgSnapshot();
+    const ev = snap.events.find(e => e.reason === 'chat_not_allowed');
+    assert.ok(ev, '应记录 chat_not_allowed');
+    assert.equal(ev.chatId, 88888888, '必须记下真实 chat_id');
+    assert.equal(ev.chatType, 'private');
+
+    // 自诊断端点要把这个 id 直接翻成人话提示
+    const hint = diag.tgTopHint(snap);
+    assert.equal(hint.code, 'chat_not_allowed');
+    assert.equal(hint.chatId, 88888888);
+    assert.match(hint.message, /88888888/);
+    assert.match(hint.message, /TG_ALLOWED_CHAT_IDS/);
+    diag.tgReset();
+  });
+
+  await checkAsync('白名单内的消息不会被误拦（chat id 用字符串比较，避免数字/字符串不一致）', async () => {
+    diag.tgReset();
+    await tgWebhookCall(
+      Object.assign({ STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN, TG_ALLOWED_CHAT_IDS: ' 777 ' }, TG_MODELS),
+      { update_id: 203, message: { message_id: 3, chat: { id: 777, type: 'private' }, text: 'hi' } },
+    );
+    const snap = diag.tgSnapshot();
+    assert.equal(snap.events.some(e => e.reason === 'chat_not_allowed'), false, '带空格的配置也应被正确解析');
+    diag.tgReset();
+  });
+
+  await checkAsync('secret 不匹配时返回 403 并留痕（改了 secret 却没重新 setWebhook 的典型症状）', async () => {
+    diag.tgReset();
+    const res = await tgWebhookCall(
+      { STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN, TG_WEBHOOK_SECRET: 'expected-secret' },
+      { update_id: 303, message: { message_id: 4, chat: { id: 1, type: 'private' }, text: 'x' } },
+      { 'X-Telegram-Bot-Api-Secret-Token': 'stale-secret' },
+    );
+    assert.equal(res.status, 403);
+    const snap = diag.tgSnapshot();
+    assert.equal(snap.counters.forbidden, 1);
+    const ev = snap.events.find(e => e.reason === 'secret_mismatch');
+    assert.ok(ev, '应记录 secret_mismatch');
+    assert.match(ev.detail, /长度 12/, '应报出收到的长度，便于发现被截断');
+    assert.equal(snap.lastError.reason, 'secret_mismatch');
+    diag.tgReset();
+  });
+
+  await checkAsync('secret 正确时放行（回归保护：别把正常请求也拦了）', async () => {
+    diag.tgReset();
+    const res = await tgWebhookCall(
+      { STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN, TG_WEBHOOK_SECRET: 'right-secret' },
+      { update_id: 304, message: { message_id: 5, chat: { id: 1, type: 'private' }, text: 'x' } },
+      { 'X-Telegram-Bot-Api-Secret-Token': 'right-secret' },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(diag.tgSnapshot().counters.forbidden, 0);
+    diag.tgReset();
+  });
+
+  await checkAsync('非消息类更新（如 channel_post）被识别为 not_a_message 并说明实际类型', async () => {
+    diag.tgReset();
+    await tgWebhookCall(
+      Object.assign({ STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN, TG_ALLOWED_CHAT_IDS: '999' }, TG_MODELS),
+      { update_id: 404, channel_post: { message_id: 6, chat: { id: 5, type: 'channel' }, text: 'x' } },
+    );
+    const ev = diag.tgSnapshot().events.find(e => e.reason === 'not_a_message');
+    assert.ok(ev, '应记录 not_a_message');
+    assert.match(ev.detail, /channel_post/);
+    diag.tgReset();
+  });
+
+  await checkAsync('请求体不是合法 JSON 时留痕并返回 500（Telegram 会重试）', async () => {
+    diag.tgReset();
+    const res = await mod.handle({
+      request: new Request('https://example.com/tg-webhook', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: 'not-json{',
+      }),
+      env: { STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN },
+      waitUntil: () => {},
+    });
+    assert.equal(res.status, 500);
+    const ev = diag.tgSnapshot().events.find(e => e.reason === 'bad_json_or_fatal');
+    assert.ok(ev, '应记录 bad_json_or_fatal');
+    diag.tgReset();
+  });
+
+  await checkAsync('/tg-setup?action=test 会往白名单第一个会话发一条自检消息', async () => {
+    const calls = stubTelegramFetch({});
+    try {
+      const res = await tgSetupCall('?key=k&action=test', {
+        STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN, TG_ALLOWED_CHAT_IDS: '555,666',
+      });
+      const j = await res.json();
+      assert.equal(j.test.ok, true);
+      assert.equal(j.test.chatId, '555');
+      const sent = JSON.parse(calls.find(c => c.method === 'sendMessage').init.body);
+      assert.equal(sent.chat_id, '555');
+      assert.match(sent.text, /连通性自检/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('action=test 在白名单为空时拒绝执行（不瞎猜发给谁）', async () => {
+    stubTelegramFetch({});
+    try {
+      const res = await tgSetupCall('?key=k&action=test', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN });
+      const j = await res.json();
+      assert.equal(j.test.ok, false);
+      assert.match(j.test.error, /TG_ALLOWED_CHAT_IDS/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('未知 action 返回 400 并列出可用值', async () => {
+    const res = await tgSetupCall('?key=k&action=whatever', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /status.*set.*delete.*test/s);
+  });
+
+  await checkAsync('/tg-setup 与 /tg-webhook 都在 Service Worker 的放行名单里（否则诊断结果会被缓存）', async () => {
+    const swMod = await import('../cloud-functions/_app/pwa/service-worker.js');
+    assert.match(swMod.SW_JS, /url\.pathname === '\/tg-webhook'/);
+    assert.match(swMod.SW_JS, /url\.pathname === '\/tg-setup'/);
+  });
+
+  await checkAsync('事件环形缓冲有上限（isolate 常驻也不会无限增长）', () => {
+    diag.tgReset();
+    const total = diag.MAX_EVENTS + 25;
+    for (let i = 0; i < total; i++) {
+      diag.tgNote('skip', { reason: 'flood', updateId: i });
+    }
+    const snap = diag.tgSnapshot();
+    assert.equal(snap.events.length, diag.MAX_EVENTS, '事件明细应被截断到上限');
+    assert.equal(snap.counters.skipped, total, '计数不该被截断 —— 只有明细有上限');
+    assert.equal(snap.events[0].updateId, total - 1, '倒序输出，第一条应是最新的');
+    diag.tgReset();
   });
 
   console.log('\n=== 结果 ===');
