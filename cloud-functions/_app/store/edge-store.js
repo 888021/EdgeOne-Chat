@@ -34,8 +34,7 @@
 // 相关环境变量：
 //   STORAGE_BACKEND      blob（默认）| kv | auto | none
 //   EO_BLOB_NAMESPACE    Blob 命名空间名，默认 edgeone-chat（自动创建）
-//                        ⚠️ 改名会切换命名空间：已写入的数据在旧命名空间里，改完就读不到了。
-//                        需要继续读旧数据时，显式设 EO_BLOB_NAMESPACE=cloudflare-chat。
+//                        ⚠️ 改了它等于换一个命名空间：原来写进去的数据在新命名空间里读不到。
 //   BLOB_CONSISTENCY     strong（默认）| eventual —— 读取一致性
 //   BLOB_AUTOPROVISION   1（默认）| 0 —— 是否在首个请求时自动创建并校验命名空间
 //   EO_BLOB_BINDING      逃生口：注入自建的 Store 实例（一般不需要）
@@ -46,15 +45,10 @@ import { makeBlobBackend, normalizeConsistency, blobLastError, hintForCode } fro
 import { makeKvBackend } from './kv-backend.js';
 
 const DEFAULT_BLOB_NAMESPACE = 'edgeone-chat';
-// 改名时保留旧命名空间名，作为「已部署过、想继续读旧数据」的显式选项，
-// 避免用户只能靠记忆拼出旧名字。
-const LEGACY_BLOB_NAMESPACE = 'cloudflare-chat';
 const PROVISION_KEY = '__meta__/provision.json';
-// 优先按这些常见名字找，命中即返回，避免全量扫描。
-// 末尾的 CLOUDFLARE_CHAT_KV 是改名前的默认名，保留它以免改名后认不出已经绑好的命名空间。
+// 优先按这些常见名字找，命中即返回，避免全量扫描
 const DEFAULT_KV_BINDING_NAMES = [
-  'CHAT_KV', 'KV', 'STORAGE', 'EO_KV', 'EDGEONE_KV',
-  'EDGEONE_CHAT_KV', 'CLOUDFLARE_CHAT_KV',
+  'CHAT_KV', 'KV', 'STORAGE', 'EO_KV', 'EDGEONE_KV', 'EDGEONE_CHAT_KV',
 ];
 // 全量扫描时要跳过的全局名，避免误触 getter 或匹配到无关对象。
 // 特别注意 'R2'：那是本层自己挂上去的 R2 替身，它同样有 get/put/delete/list，
@@ -391,9 +385,6 @@ function storageDiagnostics(context, env) {
     backend: cachedBackendName || 'memory',
     mode: mode,
     namespace: ns,
-    // 项目曾用 cloudflare-chat 作命名空间名。若你现在用的是新名字，
-    // 而旧命名空间里还有数据，改 EO_BLOB_NAMESPACE 就能切回去读。
-    legacyNamespace: ns === DEFAULT_BLOB_NAMESPACE ? LEGACY_BLOB_NAMESPACE : null,
     consistency: lastConsistency || normalizeConsistency(env && env.BLOB_CONSISTENCY),
     provision: {
       state: provisionState.state,
@@ -470,6 +461,5 @@ export {
   __awaitProvision,
   __resetForTest,
   DEFAULT_BLOB_NAMESPACE,
-  LEGACY_BLOB_NAMESPACE,
   PROVISION_KEY,
 };

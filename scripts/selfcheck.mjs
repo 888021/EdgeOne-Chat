@@ -1069,15 +1069,14 @@ async function main() {
     assert.equal(/Cloudflare/.test(j.description), false, '描述里不应再提 Cloudflare Workers');
   });
 
-  await checkAsync('Service Worker 用新缓存名，且仍会清理旧缓存', async () => {
+  await checkAsync('Service Worker 用新缓存名，且只清理自己的缓存', async () => {
     const sw = await import('../cloud-functions/_app/pwa/service-worker.js');
     assert.match(sw.SW_JS, /const CACHE = 'edgeone-chat-' \+ VERSION;/);
-    // 这条最容易被误删：不认旧前缀的话，老用户浏览器里的 cloudflare-chat-* 缓存
-    // 会永久残留且再也清不掉（因为 activate 的前缀判断不匹配了）。
-    assert.match(sw.SW_JS, /LEGACY_CACHE_PREFIX = 'cloudflare-chat-';/, '缺少旧缓存前缀常量');
-    assert.match(sw.SW_JS, /k\.indexOf\('edgeone-chat-'\) === 0 \|\| k\.indexOf\(LEGACY_CACHE_PREFIX\) === 0/,
-      'activate 里必须同时匹配新旧前缀');
+    assert.match(sw.SW_JS, /k\.indexOf\('edgeone-chat-'\) === 0/, 'activate 里应按新前缀清理');
     assert.match(sw.SW_JS, /<title>离线中 - EdgeOne-Chat<\/title>/);
+    // 已按要求移除旧前缀兼容（LEGACY_CACHE_PREFIX）。若日后要重新支持旧名，记得
+    // 同时改这里的断言和 activate 的匹配条件 —— 只改一处会静默失效。
+    assert.equal(/cloudflare/i.test(sw.SW_JS), false, 'SW 源码里不应再有旧名');
   });
 
   await checkAsync('Agent 系统提示、对外 User-Agent、Telegram 日志前缀已改名', () => {
@@ -1090,10 +1089,17 @@ async function main() {
       'cloud-functions/_app/telegram/handler.js',
       'cloud-functions/_app/ui/head.js',
       'cloud-functions/_app/ui/body.js',
+      'cloud-functions/_app/ui/app-state.js',
+      'cloud-functions/_app/pwa/manifest.js',
+      'cloud-functions/_app/pwa/service-worker.js',
+      'cloud-functions/_app/store/edge-store.js',
+      'scripts/bootstrap-blob.mjs',
+      'package.json',
+      'edgeone.json',
     ];
     for (const f of files) {
       const src = readFileSync(new URL('../' + f, import.meta.url), 'utf8');
-      assert.equal(/Cloudflare-Chat|cloudflare-chat/i.test(src), false, f + ' 里仍有旧品牌名');
+      assert.equal(/cloudflare/i.test(src), false, f + ' 里仍有旧名');
     }
     const promptSrc = readFileSync(new URL('../cloud-functions/_app/agent/prompt.js', import.meta.url), 'utf8');
     assert.match(promptSrc, /你是 EdgeOne-Chat 智能助手/);
@@ -1105,13 +1111,15 @@ async function main() {
     assert.match(tgSrc, /\[edgeone-chat\]/);
   });
 
-  await checkAsync('存储默认命名空间已是 edgeone-chat，且保留旧名供回退', () => {
+  await checkAsync('存储默认命名空间是 edgeone-chat，且不再内置任何旧命名空间后门', () => {
     assert.equal(edgeStore.DEFAULT_BLOB_NAMESPACE, 'edgeone-chat');
-    assert.equal(edgeStore.LEGACY_BLOB_NAMESPACE, 'cloudflare-chat');
+    // 曾经有个 LEGACY_BLOB_NAMESPACE 常量 + /healthz 的 legacyNamespace 提示，
+    // 已按要求移除。EO_BLOB_NAMESPACE 本身是通用变量，需要时仍可手动指向任意命名空间。
+    assert.equal('LEGACY_BLOB_NAMESPACE' in edgeStore, false, '旧命名空间常量应已移除');
     assert.ok(edgeStore.looksLikeKvNamespace(fakeKvNamespace()));
   });
 
-  await checkAsync('排障输出会提示旧命名空间名（方便找回旧数据）', async () => {
+  await checkAsync('排障输出只报当前命名空间，不带任何旧命名空间痕迹', async () => {
     edgeStore.__resetForTest();
     try {
       const res = await mod.handle({
@@ -1121,38 +1129,48 @@ async function main() {
       });
       const j = await res.json();
       assert.equal(j.debug.namespace, 'edgeone-chat');
-      assert.equal(j.debug.legacyNamespace, 'cloudflare-chat');
+      assert.equal('legacyNamespace' in j.debug, false, '不应再有 legacyNamespace 字段');
+      // kvCandidates 会列出环境里真实存在的 KV 绑定名，不纳入这条检查
+      const relevant = JSON.stringify({
+        namespace: j.debug.namespace,
+        provision: j.debug.provision,
+        hint: j.debug.hint,
+        blobError: j.debug.blobError,
+      });
+      assert.equal(/cloudflare/i.test(relevant), false, '排障信息里不应再出现旧名');
     } finally {
       edgeStore.__resetForTest();
     }
   });
 
-  await checkAsync('显式设 EO_BLOB_NAMESPACE 时不再提示旧名（用户已自己决定）', async () => {
+  await checkAsync('EO_BLOB_NAMESPACE 仍可指向任意命名空间（通用能力，不是旧名后门）', async () => {
     edgeStore.__resetForTest();
     try {
       const res = await mod.handle({
         request: new Request('https://example.com/healthz'),
-        env: { STORAGE_DEBUG: '1', EO_BLOB_NAMESPACE: 'cloudflare-chat' },
+        env: { STORAGE_DEBUG: '1', EO_BLOB_NAMESPACE: 'my-own-store' },
         waitUntil: () => {},
       });
       const j = await res.json();
-      assert.equal(j.debug.namespace, 'cloudflare-chat');
-      assert.equal(j.debug.legacyNamespace, null);
+      assert.equal(j.debug.namespace, 'my-own-store');
     } finally {
       edgeStore.__resetForTest();
     }
   });
 
-  await checkAsync('KV 绑定名候选同时含新旧名字（改名后已绑好的仍能被认出）', () => {
-    globalThis.CLOUDFLARE_CHAT_KV = fakeKvNamespace();
-    globalThis.EDGEONE_CHAT_KV = fakeKvNamespace();
+  await checkAsync('KV 常见绑定名里已无旧名；任意名字仍能被全量扫描发现', () => {
+    // 注意：从常见名列表里删掉旧名只是「源码里不再出现它」，并不会让代码认不出旧绑定名 ——
+    // 第三层是全量扫描，任意变量名都能被认出。这是通用能力，不是为旧名留的后门。
+    const src = readFileSync(new URL('../cloud-functions/_app/store/edge-store.js', import.meta.url), 'utf8');
+    assert.equal(/cloudflare/i.test(src), false, 'edge-store.js 源码里不应再有旧名');
+
+    globalThis.SOME_ARBITRARY_KV_NAME = fakeKvNamespace();
     try {
-      assert.equal(edgeStore.detectKvBinding({}, {}).name, 'globalThis.EDGEONE_CHAT_KV');
-      delete globalThis.EDGEONE_CHAT_KV;
-      assert.equal(edgeStore.detectKvBinding({}, {}).name, 'globalThis.CLOUDFLARE_CHAT_KV');
+      const found = edgeStore.detectKvBinding({}, {});
+      assert.ok(found, '任意名字的 KV 绑定都应被发现');
+      assert.equal(found.name, 'globalThis.SOME_ARBITRARY_KV_NAME');
     } finally {
-      delete globalThis.CLOUDFLARE_CHAT_KV;
-      delete globalThis.EDGEONE_CHAT_KV;
+      delete globalThis.SOME_ARBITRARY_KV_NAME;
     }
   });
 

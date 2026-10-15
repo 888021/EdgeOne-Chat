@@ -9,9 +9,6 @@
 const SW_JS = `/* EdgeOne-Chat Service Worker —— 由 _worker.js 内嵌生成，请勿单独维护此文件 */
 const VERSION = '{{PWA_VERSION}}';
 const CACHE = 'edgeone-chat-' + VERSION;
-// 旧缓存前缀：项目曾用 cloudflare-chat 命名，老用户浏览器里可能残留这些缓存。
-// 不认它们就会永久占着浏览器存储且再也清不掉，所以 activate 时一并清理。
-const LEGACY_CACHE_PREFIX = 'cloudflare-chat-';
 const SHELL = '/';
 
 const PRECACHE = [
@@ -76,8 +73,7 @@ self.addEventListener('activate', function (event) {
   event.waitUntil((async function () {
     const keys = await caches.keys();
     await Promise.all(keys.map(function (k) {
-      const isOurs = k.indexOf('edgeone-chat-') === 0 || k.indexOf(LEGACY_CACHE_PREFIX) === 0;
-      if (k !== CACHE && isOurs) return caches.delete(k);
+      if (k !== CACHE && k.indexOf('edgeone-chat-') === 0) return caches.delete(k);
       return Promise.resolve(false);
     }));
     await self.clients.claim();

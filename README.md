@@ -76,7 +76,7 @@ edgeone-chat/
 | 12 | `_app/store/blob-backend.js` | 读操作**显式传 `consistency: "strong"`**（SDK 默认是 `eventual`）；错误码记录 + 中文提示映射；写失败不再静默 | SDK 默认最终一致会导致「刚写完读不到」和「刚转存的图片 404」——这是个真 bug |
 | 13 | `scripts/bootstrap-blob.mjs` | **新增**：用 SDK 的 token 模式在部署前预创建命名空间并验证 | 把命名空间创建从「首个用户请求里」提前到部署时 |
 | 14 | `package.json` | `dev` 脚本改为 `edgeone makers dev`（CLI 命名空间已从 `edgeone pages` 迁移）；新增 `bootstrap:blob` | — |
-| 15 | 全局 | 项目更名 **`cloudflare-chat` → `edgeone-chat`**：包名、`edgeone.json`、页面标题、品牌名、PWA manifest/缓存名、Agent 系统提示、对外 User-Agent、Telegram 日志前缀、Blob 默认命名空间 | 见第五节「关于改名」。**迁移兼容性都做了处理**：旧 PWA 缓存会被主动清理、旧 KV 绑定名仍可识别、旧命名空间可用环境变量切回、浏览器旧存储键自动搬迁 |
+| 15 | 全局 | 项目更名 **`cloudflare-chat` → `edgeone-chat`**：包名、`edgeone.json`、页面标题、品牌名、PWA manifest/缓存名、Agent 系统提示、对外 User-Agent、Telegram 日志前缀、Blob 默认命名空间、KV 常见绑定名 | 见第五节「关于改名」。唯一保留的兼容层是**浏览器旧存储键的自动搬迁**（不搬会丢用户聊天记录）。其余旧名兼容（旧 PWA 缓存前缀、旧 KV 绑定名、旧命名空间提示）**均已按要求移除**；`CF-Connecting-IP` 保留，因为那是协议头名不是品牌名 |
 
 **其余 40 个文件（UI、PWA、SSRF 防护、Agent 循环、工具链、Telegram 处理器）均为原样复制。**
 
@@ -244,10 +244,12 @@ npm run bootstrap:blob:check
 
 **KV：三层自动发现，绑定成什么变量名都能认出来。**
 `detectKvBinding()` 依次尝试 `EO_KV_BINDING` 显式指定 →
-常见默认名（`CHAT_KV`、`KV`、`STORAGE`、`EO_KV`、`EDGEONE_KV`、`EDGEONE_CHAT_KV`、`CLOUDFLARE_CHAT_KV`）→
+常见默认名（`CHAT_KV`、`KV`、`STORAGE`、`EO_KV`、`EDGEONE_KV`、`EDGEONE_CHAT_KV`）→
 全量扫描 `env` / `context` / `globalThis`，特征键是 `get` + `put` + `delete`。
 第 3 层是真正的"自动"（`my_random_name` 也行）。识别用「有没有 `put`」把 KV 与
 Blob Store（用 `set`）区分开，并显式排除本层自己挂载的 `env.R2`，避免自我套娃。
+
+> 第 2 层是「少扫一圈」的快捷路径，不是白名单 —— 名字不在里面也一样能被第 3 层找到。
 
 ### 环境变量
 
@@ -281,7 +283,6 @@ SDK 的 `Store` 默认一致性是 **`eventual`**（走 CDN 缓存域），写�
     "backend": "blob:edgeone-chat",
     "mode": "blob",
     "namespace": "edgeone-chat",
-    "legacyNamespace": "cloudflare-chat",
     "consistency": "strong",
     "provision": { "state": "ready", "ok": true, "at": 1750000000000,
                    "namespace": "edgeone-chat", "error": null },
@@ -300,7 +301,6 @@ SDK 的 `Store` 默认一致性是 **`eventual`**（走 CDN 缓存域），写�
 | `provision.state` | `ready` 已创建并校验 / `pending` 进行中 / `failed` 失败（看 `error`）/ `disabled` 被 `BLOB_AUTOPROVISION=0` 关掉 / `unavailable` 存储未接通，无从创建 |
 | `blobError` | Blob 为什么没接上（最常见是依赖没装上） |
 | `lastStorageError` | 最近一次读写错误的 `op` / `code` / `message` / `hint`。**这个字段很关键**：上层大多把异常当成「读不到」处理，于是「配额满了」会伪装成「知识库是空的」——这里把它摊开 |
-| `legacyNamespace` | 项目改名前的旧命名空间名，见下方「关于改名」 |
 | `mode` | 回显 `STORAGE_BACKEND` 原始取值（拼错时额外给 `warning`） |
 
 **默认关闭**，避免对外暴露内部绑定名。
@@ -311,11 +311,11 @@ SDK 的 `Store` 默认一致性是 **`eventual`**（走 CDN 缓存域），写�
 
 | 位置 | 变化 | 影响 |
 |---|---|---|
-| Blob 命名空间 | 默认名从 `cloudflare-chat` 改为 **`edgeone-chat`** | **如果你已经部署过并写入了数据**，旧数据仍在 `cloudflare-chat` 命名空间里，改完就读不到了。要读旧数据：设 `EO_BLOB_NAMESPACE=cloudflare-chat`。`/healthz` 的 `debug.legacyNamespace` 会提示旧名字 |
-| PWA 缓存 | `edgeone-chat-<版本>` | 老浏览器里的 `cloudflare-chat-*` 缓存会被 activate 逻辑**主动清掉**（代码里保留了旧前缀常量），不会永久占空间 |
+| Blob 命名空间 | 默认名从 `cloudflare-chat` 改为 **`edgeone-chat`** | 命名空间就是数据边界：**换名等于换一个空库**。旧命名空间里的数据不会自动搬过来，也不会自动删掉（在控制台还能看到）。本项目不再内置「切回旧命名空间」的提示或常量 |
+| PWA 缓存 | `edgeone-chat-<版本>` | 旧前缀 `cloudflare-chat-*` 的兼容已移除。若你曾部署过改名前的版本，老访客浏览器里的旧缓存**不会再被自动清掉**（不影响功能，只是白占几十 KB~几 MB，直到用户自己清浏览器缓存） |
 | PWA 名称 / 页面标题 / 品牌名 | `EdgeOne-Chat`（简称 `EO-Chat`） | 需要重新安装 PWA 才会更新桌面图标名 |
 | User-Agent | `EdgeOne-Chat/7.0` | 工具调用（网页抓取、维基百科、汇率）对外标识 |
-| KV 绑定名候选 | 新增 `EDGEONE_CHAT_KV`，**保留** `CLOUDFLARE_CHAT_KV` | 若你已在控制台绑成旧名，仍能被自动发现，不用重绑 |
+| KV 绑定名候选 | 只剩 `CHAT_KV` / `KV` / `STORAGE` / `EO_KV` / `EDGEONE_KV` / `EDGEONE_CHAT_KV` | 旧名 `CLOUDFLARE_CHAT_KV` 已从常见名列表移除。注意这只是**源码里不再出现旧名**：KV 发现的第三层是全量扫描，任意变量名都能被认出，所以你在控制台绑成旧名也照样能用 |
 | 浏览器本地存储键名 | `cfchat_sessions` → **`eochat_sessions`**、`cfchat_agent_mode` → **`eochat_agent_mode`** | **已配自动迁移**：读到旧键就搬到新键再清掉，老用户聊天记录与开关状态都不会丢。迁移是幂等的，且更老的 `nvidia_ai_sessions` 也会一路搬到新键 |
 | `CF-Connecting-IP` 请求头 | **未改动** | 这是 Cloudflare 的协议头名（客户端 IP 来源之一），不是品牌名，改了 IP 限流会失效 |
 | 项目目录名 | `cloudflare-chat-edgeone/` → **`edgeone-chat/`** | 仅影响磁盘路径，与运行时无关。之前分享过的路径需要更新 |
@@ -481,8 +481,9 @@ node scripts/selfcheck.mjs      # 或 npm run selfcheck
 - **生成页面本身的合法性**：把页面内联脚本抽出来单独 parse，
   防止模板字符串两层转义把前端写坏（这类错误服务端完全看不出来）
 - **品牌名改名**：页面标题/品牌名/PWA meta/manifest 都已是 `EdgeOne-Chat`、
-  Service Worker 用新缓存名**且仍会清理旧前缀**（这条最容易被误删）、
-  Agent 系统提示与对外 User-Agent 已改名、存储默认命名空间已切换且保留旧名供回退
+  Service Worker 用新缓存名、Agent 系统提示与对外 User-Agent 已改名、
+  存储默认命名空间已切换。另有一条**源码级兜底断言**：13 个关键文件里都不允许再出现
+  `cloudflare`（不分大小写），防止以后手滑把旧名带回来
 - **浏览器端键名迁移（行为级测试）**：从渲染出的页面里**切出真实代码片段**跑，
   不复制逻辑。覆盖 `cfchat_sessions` / `nvidia_ai_sessions` → `eochat_sessions` 的两级搬迁、
   新旧键并存时以新键为准、全新用户不凭空写入、旧键内容损坏时降级为空而非崩溃、
@@ -510,9 +511,9 @@ edgeone makers dev
 | `storage` 显示已接通，但重启后数据还是丢 | 用 `/healthz?probe=1`（需 `STORAGE_DEBUG=1`）做一次真实读写。`probe.ok:false` 说明 SDK 加载了但没权限/没配额，看 `probe.reason` |
 | 知识库突然「空了」，但之前明明有文档 | 看 `/healthz` 的 `debug.lastStorageError`。上层把存储异常当成「读不到」处理，所以配额满 / 被限流都会伪装成「空」。非 `null` 时 `hint` 字段会告诉你怎么办 |
 | 刚存的知识库文档搜不到 / 刚生成的图裂开 | 读取一致性被改成了 `eventual`。删掉 `BLOB_CONSISTENCY` 或设为 `strong`。默认就是 `strong`，出现这个问题通常是被手动改过 |
-| 改名后知识库/记忆/图片全都不见了 | 命名空间跟着换了（`cloudflare-chat` → `edgeone-chat`）。旧数据还在旧命名空间里，设 `EO_BLOB_NAMESPACE=cloudflare-chat` 重新部署即可读回；`/healthz` 的 `debug.legacyNamespace` 会提示旧名字 |
+| 改名后知识库/记忆/图片全都不见了 | 命名空间跟着换了（`cloudflare-chat` → `edgeone-chat`），新命名空间是空的。旧数据没有被删，仍在旧命名空间里。本项目不再内置「切回旧命名空间」的开关 —— 需要时自己设 `EO_BLOB_NAMESPACE=cloudflare-chat` 重新部署（`EO_BLOB_NAMESPACE` 是通用变量，接受任意合法命名空间名） |
 | 改名后浏览器里历史对话没了 | 理论上不该发生（有自动迁移）。确认页面已更新到新版（旧 SW 缓存的旧页面读的是旧键）。若仍复现，看浏览器 localStorage 里 `eochat_sessions` 是否有值、`cfchat_sessions` 是否残留 |
-| 改名后 PWA 图标名还是旧的 | 桌面图标名来自 manifest，需要重新「添加到主屏幕」才会更新。旧缓存会被 SW 的 activate 逻辑自动清理，不用手动清 |
+| 改名后 PWA 图标名还是旧的 | 桌面图标名来自 manifest，需要重新「添加到主屏幕」才会更新。当前版本的缓存会被 SW 的 activate 逻辑自动清理；但如果你曾部署过改名前的版本，那些旧前缀缓存不会再被自动清（见第五节「关于改名」），可在浏览器设置里手动清一次 |
 | 想用 KV 但 `storage` 一直是 `memory` | KV 需要三步且都不可省：控制台开通 KV 账户 → 创建命名空间 → 绑定到项目。另注意 **KV 仅 Edge Functions 可用**，跑在 Cloud Functions 上的项目用不了 KV（本项目默认就是 Cloud Functions，建议直接用 Blob）。另外默认后端是 Blob，**不会自动退到 KV**，要显式设 `STORAGE_BACKEND=kv` |
 | KV 绑定名不想用 `CHAT_KV` | 不用改，任意绑定名都能被自动发现。设 `STORAGE_DEBUG=1` 后看 `debug.kvCandidates` 确认是否扫到了 |
 | 页面提示「未配置模型」 | 环境变量没配或配完没重新部署。注意 `MODEL_1` 的格式是 `模型ID:显示名`，多个用英文逗号分隔 |
