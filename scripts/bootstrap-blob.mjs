@@ -10,14 +10,14 @@
 //
 // 用法：
 //   EO_PROJECT_ID=pages-xxxxxxxx EO_API_TOKEN=xxx node scripts/bootstrap-blob.mjs
-//   node scripts/bootstrap-blob.mjs --project-id pages-xxxxxxxx --token xxx --namespace cloudflare-chat
+//   node scripts/bootstrap-blob.mjs --project-id pages-xxxxxxxx --token xxx --namespace edgeone-chat
 //   node scripts/bootstrap-blob.mjs --check          # 只检查，不创建
 //   node scripts/bootstrap-blob.mjs --help
 //
 // 参数（命令行优先于环境变量）：
 //   --project-id <id>    EdgeOne Makers 项目 ID（形如 pages-urtsvuwmfvli）。也可用 EO_PROJECT_ID
 //   --token <token>      API Token（控制台「API Token」页面生成）。也可用 EO_API_TOKEN
-//   --namespace <name>   Blob 命名空间名，默认 cloudflare-chat。也可用 EO_BLOB_NAMESPACE
+//   --namespace <name>   Blob 命名空间名，默认 edgeone-chat。也可用 EO_BLOB_NAMESPACE
 //   --check              只报告状态，不创建
 //   --json               以 JSON 输出（便于 CI 解析）
 //
@@ -62,7 +62,7 @@ Blob 命名空间预创建 / 就绪检查
 参数：
   --project-id <id>   EdgeOne Makers 项目 ID（形如 pages-urtsvuwmfvli），或环境变量 EO_PROJECT_ID
   --token <token>     API Token，或环境变量 EO_API_TOKEN
-  --namespace <name>  Blob 命名空间名，默认 cloudflare-chat，或环境变量 EO_BLOB_NAMESPACE
+  --namespace <name>  Blob 命名空间名，默认 edgeone-chat，或环境变量 EO_BLOB_NAMESPACE
   --check             只报告状态，不创建
   --json              以 JSON 输出
 
@@ -91,7 +91,7 @@ if (args.unknown && args.unknown.length) {
 
 const projectId = args.projectId || process.env.EO_PROJECT_ID || '';
 const token = args.token || process.env.EO_API_TOKEN || '';
-const namespace = args.namespace || process.env.EO_BLOB_NAMESPACE || 'cloudflare-chat';
+const namespace = args.namespace || process.env.EO_BLOB_NAMESPACE || 'edgeone-chat';
 
 if (!projectId) {
   console.error(USAGE);
@@ -196,7 +196,7 @@ async function main() {
     try {
       await store.setJSON(MARKER_KEY, {
         namespace: namespace,
-        project: 'cloudflare-chat-edgeone',
+        project: 'edgeone-chat',
         provisioned_at: new Date().toISOString(),
         provisioned_by: 'scripts/bootstrap-blob.mjs',
       });

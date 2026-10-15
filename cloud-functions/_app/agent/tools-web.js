@@ -99,7 +99,7 @@ async function tryJinaFallback(targetUrl, signal) {
     const jinaUrl = 'https://r.jina.ai/' + targetUrl;
     const res = await fetch(jinaUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; Cloudflare-Chat/7.0)',
+        'User-Agent': 'Mozilla/5.0 (compatible; EdgeOne-Chat/7.0)',
         'X-Return-Format': 'markdown'
       },
       signal

@@ -2,9 +2,9 @@
 
 // ================= PWA：Web App Manifest =================
 const MANIFEST_JSON = JSON.stringify({
-  name: 'Cloudflare-Chat',
-  short_name: 'CF-Chat',
-  description: '基于 Cloudflare Workers 的多通道 AI 对话前端',
+  name: 'EdgeOne-Chat',
+  short_name: 'EO-Chat',
+  description: '跑在腾讯云 EdgeOne Makers 上的多通道 AI 对话前端',
   lang: 'zh-CN',
   start_url: '/',
   scope: '/',

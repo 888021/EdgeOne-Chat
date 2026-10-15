@@ -2,6 +2,7 @@
 // 运行：node scripts/selfcheck.mjs
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 let pass = 0;
 let fail = 0;
@@ -79,6 +80,17 @@ function fakeKvNamespace() {
       const complete = next >= all.length;
       return { complete, cursor: complete ? null : String(next), keys: page.map(k => ({ key: k })) };
     },
+  };
+}
+
+// 内存版 localStorage，用来对「旧键自动迁移」做行为级测试
+function fakeLocalStorage(init) {
+  const m = new Map(Object.entries(init || {}));
+  return {
+    getItem(k) { return m.has(String(k)) ? m.get(String(k)) : null; },
+    setItem(k, v) { m.set(String(k), String(v)); },
+    removeItem(k) { m.delete(String(k)); },
+    __dump() { const o = {}; m.forEach((v, k) => { o[k] = v; }); return o; },
   };
 }
 
@@ -551,7 +563,7 @@ async function main() {
       const written = await raw.get(edgeStore.PROVISION_KEY);
       assert.ok(written, '应写入置备标记对象');
       const meta = JSON.parse(written);
-      assert.equal(meta.namespace, 'cloudflare-chat');
+      assert.equal(meta.namespace, 'edgeone-chat');
       assert.ok(meta.provisioned_at, '应带创建时间');
     } finally {
       edgeStore.__resetForTest();
@@ -569,7 +581,7 @@ async function main() {
       });
       const j = await res.json();
       assert.ok(j.debug.provision, '应输出置备状态');
-      assert.equal(j.debug.provision.namespace, 'cloudflare-chat');
+      assert.equal(j.debug.provision.namespace, 'edgeone-chat');
       await edgeStore.__awaitProvision();
       // 再请求一次，此时应已就绪
       const res2 = await mod.handle({
@@ -654,7 +666,7 @@ async function main() {
       });
       const j = await res.json();
       assert.equal(j.debug.mode, 'blob', '未设置 STORAGE_BACKEND 时应回显默认值 blob');
-      assert.equal(j.debug.namespace, 'cloudflare-chat');
+      assert.equal(j.debug.namespace, 'edgeone-chat');
       assert.equal(j.debug.consistency, 'strong', '读取一致性默认应为 strong');
       assert.equal(j.debug.blobBindingUsed, null);
       assert.ok(j.debug.provision, '应输出置备状态');
@@ -1037,6 +1049,191 @@ async function main() {
     assert.match(pageHtml, /renderer\.image\s*=\s*function/, '缺少图片渲染器');
     assert.match(pageHtml, /\.md-img-link/, '缺少图片链接样式');
     assert.match(pageHtml, /内联图片过大，已省略/, '缺少 localStorage 配额兜底');
+  });
+
+  console.log('\n=== 10. 品牌名改名（cloudflare-chat → edgeone-chat） ===');
+
+  await checkAsync('页面标题、品牌名、PWA meta 都已是 EdgeOne-Chat', () => {
+    assert.match(pageHtml, /<title>EdgeOne-Chat<\/title>/, '页面标题未改');
+    assert.match(pageHtml, /<span class="brand-name">EdgeOne-Chat<\/span>/, '侧边栏品牌名未改');
+    assert.match(pageHtml, /name="apple-mobile-web-app-title" content="EdgeOne-Chat"/);
+    assert.match(pageHtml, /name="application-name" content="EdgeOne-Chat"/);
+    assert.equal(/Cloudflare-Chat/.test(pageHtml), false, '页面里不应再有旧品牌名');
+  });
+
+  await checkAsync('PWA manifest 已改名', async () => {
+    const m = await import('../cloud-functions/_app/pwa/manifest.js');
+    const j = JSON.parse(m.MANIFEST_JSON);
+    assert.equal(j.name, 'EdgeOne-Chat');
+    assert.equal(j.short_name, 'EO-Chat');
+    assert.equal(/Cloudflare/.test(j.description), false, '描述里不应再提 Cloudflare Workers');
+  });
+
+  await checkAsync('Service Worker 用新缓存名，且仍会清理旧缓存', async () => {
+    const sw = await import('../cloud-functions/_app/pwa/service-worker.js');
+    assert.match(sw.SW_JS, /const CACHE = 'edgeone-chat-' \+ VERSION;/);
+    // 这条最容易被误删：不认旧前缀的话，老用户浏览器里的 cloudflare-chat-* 缓存
+    // 会永久残留且再也清不掉（因为 activate 的前缀判断不匹配了）。
+    assert.match(sw.SW_JS, /LEGACY_CACHE_PREFIX = 'cloudflare-chat-';/, '缺少旧缓存前缀常量');
+    assert.match(sw.SW_JS, /k\.indexOf\('edgeone-chat-'\) === 0 \|\| k\.indexOf\(LEGACY_CACHE_PREFIX\) === 0/,
+      'activate 里必须同时匹配新旧前缀');
+    assert.match(sw.SW_JS, /<title>离线中 - EdgeOne-Chat<\/title>/);
+  });
+
+  await checkAsync('Agent 系统提示、对外 User-Agent、Telegram 日志前缀已改名', () => {
+    // 静态检查源码文本：这几个字符串在运行时很难被观测到（要真去抓网页/发 TG 消息），
+    // 但一旦漏改就会把旧品牌名暴露给第三方站点或日志。
+    const files = [
+      'cloud-functions/_app/agent/prompt.js',
+      'cloud-functions/_app/agent/tools-local.js',
+      'cloud-functions/_app/agent/tools-web.js',
+      'cloud-functions/_app/telegram/handler.js',
+      'cloud-functions/_app/ui/head.js',
+      'cloud-functions/_app/ui/body.js',
+    ];
+    for (const f of files) {
+      const src = readFileSync(new URL('../' + f, import.meta.url), 'utf8');
+      assert.equal(/Cloudflare-Chat|cloudflare-chat/i.test(src), false, f + ' 里仍有旧品牌名');
+    }
+    const promptSrc = readFileSync(new URL('../cloud-functions/_app/agent/prompt.js', import.meta.url), 'utf8');
+    assert.match(promptSrc, /你是 EdgeOne-Chat 智能助手/);
+    const localSrc = readFileSync(new URL('../cloud-functions/_app/agent/tools-local.js', import.meta.url), 'utf8');
+    assert.match(localSrc, /EdgeOne-Chat\/7\.0/);
+    // 顺带确认没把 User-Agent 里指向 Cloudflare 的 URL 留在对外请求上
+    assert.equal(/workers\.cloudflare\.com/.test(localSrc), false, 'UA 里不应再指向 Cloudflare');
+    const tgSrc = readFileSync(new URL('../cloud-functions/_app/telegram/handler.js', import.meta.url), 'utf8');
+    assert.match(tgSrc, /\[edgeone-chat\]/);
+  });
+
+  await checkAsync('存储默认命名空间已是 edgeone-chat，且保留旧名供回退', () => {
+    assert.equal(edgeStore.DEFAULT_BLOB_NAMESPACE, 'edgeone-chat');
+    assert.equal(edgeStore.LEGACY_BLOB_NAMESPACE, 'cloudflare-chat');
+    assert.ok(edgeStore.looksLikeKvNamespace(fakeKvNamespace()));
+  });
+
+  await checkAsync('排障输出会提示旧命名空间名（方便找回旧数据）', async () => {
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.debug.namespace, 'edgeone-chat');
+      assert.equal(j.debug.legacyNamespace, 'cloudflare-chat');
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('显式设 EO_BLOB_NAMESPACE 时不再提示旧名（用户已自己决定）', async () => {
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { STORAGE_DEBUG: '1', EO_BLOB_NAMESPACE: 'cloudflare-chat' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.debug.namespace, 'cloudflare-chat');
+      assert.equal(j.debug.legacyNamespace, null);
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('KV 绑定名候选同时含新旧名字（改名后已绑好的仍能被认出）', () => {
+    globalThis.CLOUDFLARE_CHAT_KV = fakeKvNamespace();
+    globalThis.EDGEONE_CHAT_KV = fakeKvNamespace();
+    try {
+      assert.equal(edgeStore.detectKvBinding({}, {}).name, 'globalThis.EDGEONE_CHAT_KV');
+      delete globalThis.EDGEONE_CHAT_KV;
+      assert.equal(edgeStore.detectKvBinding({}, {}).name, 'globalThis.CLOUDFLARE_CHAT_KV');
+    } finally {
+      delete globalThis.CLOUDFLARE_CHAT_KV;
+      delete globalThis.EDGEONE_CHAT_KV;
+    }
+  });
+
+  console.log('\n=== 11. 浏览器端键名迁移（cfchat_* → eochat_*，不能丢老用户记录） ===');
+
+  // 直接从渲染出来的页面里切出真实代码片段来跑 —— 不复制一份逻辑，避免「测试和实现各写一遍」。
+  function sliceScript(from, to) {
+    const i = pageHtml.indexOf(from);
+    assert.ok(i >= 0, '页面里找不到片段起点：' + from);
+    const j = pageHtml.indexOf(to, i);
+    assert.ok(j > i, '页面里找不到片段终点：' + to);
+    return pageHtml.slice(i, j);
+  }
+
+  function runSessionsScript(lsInit) {
+    const code = sliceScript("const STORAGE_KEY = 'eochat_sessions'", 'let currentSessionId = null;');
+    const ls = fakeLocalStorage(lsInit);
+    const fn = new Function('localStorage', code + '\nreturn { sessions: sessions, KEY: STORAGE_KEY, LEGACY: LEGACY_STORAGE_KEYS };');
+    return { out: fn(ls), ls: ls };
+  }
+
+  await checkAsync('老用户 cfchat_sessions 会被搬到 eochat_sessions（数据不丢）', () => {
+    const old = JSON.stringify([{ id: 's1', title: '旧会话', messages: [] }]);
+    const r = runSessionsScript({ cfchat_sessions: old });
+    assert.equal(r.out.KEY, 'eochat_sessions');
+    assert.equal(r.out.sessions.length, 1, '旧会话应被读出来');
+    assert.equal(r.out.sessions[0].title, '旧会话');
+    assert.equal(r.ls.getItem('eochat_sessions'), old, '应写入新键');
+    assert.equal(r.ls.getItem('cfchat_sessions'), null, '应清掉旧键');
+  });
+
+  await checkAsync('更老的 nvidia_ai_sessions 也能一路迁移到 eochat_sessions', () => {
+    const ancient = JSON.stringify([{ id: 'a1', title: '上古会话' }]);
+    const r = runSessionsScript({ nvidia_ai_sessions: ancient });
+    assert.equal(r.out.sessions.length, 1);
+    assert.equal(r.out.sessions[0].title, '上古会话');
+    assert.equal(r.ls.getItem('eochat_sessions'), ancient);
+    assert.equal(r.ls.getItem('nvidia_ai_sessions'), null);
+  });
+
+  await checkAsync('新旧键同时存在时以新键为准，且旧键被清理', () => {
+    const r = runSessionsScript({
+      eochat_sessions: JSON.stringify([{ id: 'new' }]),
+      cfchat_sessions: JSON.stringify([{ id: 'old' }]),
+    });
+    assert.equal(r.out.sessions[0].id, 'new', '不能拿旧键覆盖新键');
+    assert.equal(r.ls.getItem('cfchat_sessions'), null);
+  });
+
+  await checkAsync('全新用户（无任何旧键）不报错、会话为空', () => {
+    const r = runSessionsScript({});
+    assert.deepEqual(r.out.sessions, []);
+    assert.equal(r.ls.getItem('eochat_sessions'), null, '没数据就不该凭空写入');
+  });
+
+  await checkAsync('旧键内容损坏（非 JSON / 非数组）时降级为空而不是崩掉', () => {
+    assert.deepEqual(runSessionsScript({ cfchat_sessions: '{坏数据' }).out.sessions, []);
+    assert.deepEqual(runSessionsScript({ cfchat_sessions: '"not-an-array"' }).out.sessions, []);
+  });
+
+  function runAgentModeScript(lsInit) {
+    const code = sliceScript("const AGENT_MODE_KEY = 'eochat_agent_mode'", 'function renderAgentToggle()');
+    const ls = fakeLocalStorage(lsInit);
+    const fn = new Function('localStorage', code + '\nreturn { agentMode: agentMode, KEY: AGENT_MODE_KEY };');
+    return { out: fn(ls), ls: ls };
+  }
+
+  await checkAsync('Agent 开关：默认开启，旧键 cfchat_agent_mode 的值被搬过来', () => {
+    assert.equal(runAgentModeScript({}).out.agentMode, true, '无记录时默认开启');
+    const off = runAgentModeScript({ cfchat_agent_mode: '0' });
+    assert.equal(off.out.agentMode, false, '旧键里的「关闭」必须被继承');
+    assert.equal(off.ls.getItem('eochat_agent_mode'), '0');
+    assert.equal(off.ls.getItem('cfchat_agent_mode'), null);
+    const on = runAgentModeScript({ cfchat_agent_mode: '1' });
+    assert.equal(on.out.agentMode, true);
+  });
+
+  await checkAsync('Agent 开关：新键存在时优先，不被旧键覆盖', () => {
+    const r = runAgentModeScript({ eochat_agent_mode: '0', cfchat_agent_mode: '1' });
+    assert.equal(r.out.agentMode, false);
+    assert.equal(r.ls.getItem('cfchat_agent_mode'), '1', '新键已存在时不该去动旧键');
   });
 
   console.log('\n=== 结果 ===');

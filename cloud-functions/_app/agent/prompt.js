@@ -23,7 +23,7 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
   } catch (e) { timeStr = now.toISOString(); }
   const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
   const hasKb = kbList.length > 0;
-  let p = '你是 Cloudflare-Chat 智能助手，一个具备自主规划、工具调用和知识库检索能力的 AI Agent。\n';
+  let p = '你是 EdgeOne-Chat 智能助手，一个具备自主规划、工具调用和知识库检索能力的 AI Agent。\n';
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   const kbToolClause = hasKb
     ? '问题涉及知识库文档 → 直接 read_doc 读相关文档（标题列表已在下方【知识库文档列表】给出，无需先 list_docs；超长文档可传 offset 分页续读；标题对不上时 read_doc 会自动用多关键词搜全库正文），内容优先引用并注明"据知识库文档《xxx》"'

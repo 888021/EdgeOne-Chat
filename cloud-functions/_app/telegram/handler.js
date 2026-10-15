@@ -134,7 +134,7 @@ export async function handleTgWebhook(request, env) {
     }
   } else if (env.TG_BOT_TOKEN && !warnedNoWebhookSecret) {
     warnedNoWebhookSecret = true;
-    console.log('⚠️ [cloudflare-chat] 未配置 TG_WEBHOOK_SECRET，/tg-webhook 处于开放状态；强烈建议配置 secret_token 并用 setWebhook 重新绑定，同时可配 TG_ALLOWED_CHAT_IDS 白名单只允许自己的聊天。');
+    console.log('⚠️ [edgeone-chat] 未配置 TG_WEBHOOK_SECRET，/tg-webhook 处于开放状态；强烈建议配置 secret_token 并用 setWebhook 重新绑定，同时可配 TG_ALLOWED_CHAT_IDS 白名单只允许自己的聊天。');
   }
 
   try {

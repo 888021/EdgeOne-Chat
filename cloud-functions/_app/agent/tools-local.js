@@ -298,7 +298,7 @@ async function toolExchangeRate(args) {
       const cg = await fetchJson(
         `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(cryptoId)}&vs_currencies=${encodeURIComponent(fiat)},usd,cny&include_24hr_change=true`,
         10000,
-        { 'Accept': 'application/json', 'User-Agent': 'Cloudflare-Chat/7.0' }
+        { 'Accept': 'application/json', 'User-Agent': 'EdgeOne-Chat/7.0' }
       );
       const item = cg && cg[cryptoId];
       if (!item) return '汇率查询失败: 未找到加密货币 ' + (isFromCrypto ? from : to) + ' 的实时行情';
@@ -347,7 +347,7 @@ async function toolWikiLookup(query, lang) {
   const wikiLang = (lang === 'en' || lang === 'zh') ? lang : (hasCjk ? 'zh' : 'en');
   const host = `https://${wikiLang}.wikipedia.org`;
   const headers = {
-    'User-Agent': 'Cloudflare-Chat/7.0 (https://workers.cloudflare.com)',
+    'User-Agent': 'EdgeOne-Chat/7.0 (+https://edgeone.ai)',
     'Accept-Language': wikiLang === 'zh' ? 'zh-CN,zh;q=0.9' : 'en-US,en;q=0.9'
   };
   try {

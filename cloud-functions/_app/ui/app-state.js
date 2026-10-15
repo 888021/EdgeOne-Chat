@@ -1,23 +1,34 @@
 // 会话本地存储、DOM 引用、主题、模型与 Agent 开关（_worker.js 原第 3800-3962 行，内嵌页面分片；只允许字符串导出）
-export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 key（nvidia_ai_sessions）的数据自动迁移
-  const STORAGE_KEY = 'cfchat_sessions';
-  const LEGACY_STORAGE_KEY = 'nvidia_ai_sessions';
+export default `  // 会话本地存储：v7.0.1 起改用 eochat_sessions。
+  // 旧 key 按「新→旧」顺序依次尝试并自动搬过来：cfchat_sessions（v6.1~7.0）→ nvidia_ai_sessions（v6.1 之前）。
+  // 迁移必须是「读到就搬」而不是「直接换名」—— 否则所有老用户浏览器里的聊天记录会一次性消失。
+  const STORAGE_KEY = 'eochat_sessions';
+  const LEGACY_STORAGE_KEYS = ['cfchat_sessions', 'nvidia_ai_sessions'];
   const MAX_SEND_MSGS = 60;   // 每次请求最多带最近 60 条消息，避免超长会话撑爆请求体
   const MAX_STORE_MSGS = 200; // 每个会话本地最多保留 200 条，超限从最旧开始丢弃
   const MAX_SESSIONS = 50;    // v6.8.9：会话数上限，超出裁掉最旧的，防止 localStorage 被塞爆
+  function pickLegacySessionRaw() {
+    for (var i = 0; i < LEGACY_STORAGE_KEYS.length; i++) {
+      var v = localStorage.getItem(LEGACY_STORAGE_KEYS[i]);
+      if (v) return v;
+    }
+    return null;
+  }
   function loadSessions() {
     try {
-      var raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
+      var raw = localStorage.getItem(STORAGE_KEY) || pickLegacySessionRaw();
       if (raw) { var arr = JSON.parse(raw); if (Array.isArray(arr)) return arr; }
     } catch (e) {}
     return [];
   }
   let sessions = loadSessions();
+  // 迁移：把找到的旧数据写到新 key，再清掉旧 key。幂等，重复执行无害。
   try {
-    if (!localStorage.getItem(STORAGE_KEY) && localStorage.getItem(LEGACY_STORAGE_KEY)) {
-      localStorage.setItem(STORAGE_KEY, localStorage.getItem(LEGACY_STORAGE_KEY));
+    if (!localStorage.getItem(STORAGE_KEY)) {
+      var legacyRaw = pickLegacySessionRaw();
+      if (legacyRaw) localStorage.setItem(STORAGE_KEY, legacyRaw);
     }
-    localStorage.removeItem(LEGACY_STORAGE_KEY);
+    for (var j = 0; j < LEGACY_STORAGE_KEYS.length; j++) localStorage.removeItem(LEGACY_STORAGE_KEYS[j]);
   } catch (e) {}
   let currentSessionId = null;
 
@@ -200,8 +211,22 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   modelSelect.addEventListener('input', onModelChange);
 
   // v6.6.0: Web 端 Agent 模式开关（默认开启，优先检索知识库文档）
+  // v7.0.1: key 从 cfchat_agent_mode 改为 eochat_agent_mode，旧值自动搬过来
   const agentToggle = document.getElementById('agentToggle');
-  let agentMode = localStorage.getItem('cfchat_agent_mode') !== '0';
+  const AGENT_MODE_KEY = 'eochat_agent_mode';
+  const LEGACY_AGENT_MODE_KEY = 'cfchat_agent_mode';
+  let agentMode = true;
+  try {
+    var amRaw = localStorage.getItem(AGENT_MODE_KEY);
+    if (amRaw === null) {
+      amRaw = localStorage.getItem(LEGACY_AGENT_MODE_KEY);
+      if (amRaw !== null) {
+        localStorage.setItem(AGENT_MODE_KEY, amRaw);
+        localStorage.removeItem(LEGACY_AGENT_MODE_KEY);
+      }
+    }
+    if (amRaw !== null) agentMode = amRaw !== '0';
+  } catch (e) {}
   function renderAgentToggle() {
     if (!agentToggle) return;
     agentToggle.classList.toggle('active', agentMode);
@@ -213,7 +238,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   if (agentToggle) {
     agentToggle.addEventListener('click', () => {
       agentMode = !agentMode;
-      try { localStorage.setItem('cfchat_agent_mode', agentMode ? '1' : '0'); } catch (e) {}
+      try { localStorage.setItem(AGENT_MODE_KEY, agentMode ? '1' : '0'); } catch (e) {}
       renderAgentToggle();
     });
     renderAgentToggle();

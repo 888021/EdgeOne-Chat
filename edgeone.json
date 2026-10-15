@@ -1,5 +1,5 @@
 {
-  "name": "cloudflare-chat-edgeone",
+  "name": "edgeone-chat",
   "installCommand": "npm install",
   "nodeVersion": "20.18.0",
   "cloudFunctions": {

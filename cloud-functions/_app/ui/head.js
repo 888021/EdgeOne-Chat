@@ -4,7 +4,7 @@ export default `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Cloudflare-Chat</title>
+  <title>EdgeOne-Chat</title>
 
   <!-- ===== PWA ===== -->
   <link rel="manifest" href="/manifest.webmanifest">
@@ -13,8 +13,8 @@ export default `<!DOCTYPE html>
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
-  <meta name="apple-mobile-web-app-title" content="Cloudflare-Chat">
-  <meta name="application-name" content="Cloudflare-Chat">
+  <meta name="apple-mobile-web-app-title" content="EdgeOne-Chat">
+  <meta name="application-name" content="EdgeOne-Chat">
   <link rel="icon" type="image/png" href="/icon-192.png">
   <link rel="apple-touch-icon" href="/icon-192.png">
   
