@@ -409,7 +409,9 @@ export default `  <style>
     .markdown-body th, .markdown-body td {
       border: 1px solid var(--border); padding: 6px 10px; text-align: left;
     }
-    .markdown-body img { max-width: 100%; height: auto; border-radius: 8px; margin-top: 8px; }
+    .markdown-body img { max-width: 100%; height: auto; border-radius: 10px; margin-top: 8px; border: 1px solid var(--border); }
+    .md-img-link { display: inline-block; max-width: 100%; line-height: 0; }
+    .md-img-link img { cursor: zoom-in; margin-top: 0; }
 
     /* ---------------- 代码块 ---------------- */
     .code-wrapper {

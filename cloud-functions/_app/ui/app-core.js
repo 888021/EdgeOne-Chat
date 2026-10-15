@@ -27,6 +27,13 @@ export default `<script>
     return tmp.textContent || '';
   }
 
+  // 属性值转义：比 escapeHtml 多转义引号，避免拼 HTML 时被属性注入
+  const escAttr = (s) => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
   if (window.marked && window.marked.Renderer) {
     const renderer = new marked.Renderer();
     renderer.code = function(code, language) {
@@ -56,6 +63,17 @@ export default `<script>
                '</div>' +
                '<pre><code class="hljs ' + (language || '') + '">' + highlightedCode + '</code></pre>' +
              '</div>';
+    };
+
+    // 生图结果可视化：图片外包一层链接，点击可在新标签页看原图。
+    // data: 内联图片不再包链接 —— href 里再放一份 base64 会让 DOM 体积凭空翻倍。
+    renderer.image = function(href, title, text) {
+      const src = String(href == null ? '' : href);
+      const alt = escAttr(text == null || text === '' ? '生成结果' : text);
+      const tip = escAttr(title || '点击查看原图');
+      const img = '<img src="' + escAttr(src) + '" alt="' + alt + '" title="' + tip + '" loading="lazy">';
+      if (!src || src.indexOf('data:') === 0) return img;
+      return '<a class="md-img-link" href="' + escAttr(src) + '" target="_blank" rel="noopener noreferrer">' + img + '</a>';
     };
 
     marked.setOptions({ breaks: true, renderer: renderer });

@@ -100,6 +100,41 @@ function getChannelConfig(env) {
   return cachedConfig;
 }
 
+// ======= 图像接口请求体 =======
+// 关键点：必须显式声明 response_format。
+// 多数图像接口（含 SenseNova 日日新）的默认值是 b64_json —— 只返回 base64、不返回 url。
+// 前端拿到 base64 既没法直接渲染，内联进 Markdown 又会撑爆 localStorage 配额。
+// 这里默认要 url，再由 images.js 转存成自有域名下的长期链接。
+// 想强制 base64 可设 IMAGE_RESPONSE_FORMAT=b64_json。
+function envBool(v) {
+  if (v === undefined || v === null || String(v).trim() === '') return null;
+  const s = String(v).trim().toLowerCase();
+  return !(s === '0' || s === 'false' || s === 'off' || s === 'no');
+}
+
+function buildImagePayload(env, model, prompt) {
+  const p = { model: model, prompt: prompt, n: 1 };
+
+  const rf = String(env.IMAGE_RESPONSE_FORMAT || 'url').trim().toLowerCase();
+  p.response_format = (rf === 'b64_json') ? 'b64_json' : 'url';
+
+  const size = String(env.IMAGE_SIZE || '').trim();
+  if (size) p.size = size;
+
+  const fmt = String(env.IMAGE_OUTPUT_FORMAT || '').trim().toLowerCase();
+  if (fmt) p.output_format = fmt;
+
+  // watermark / prompt_extend 不配置就不发送，交给上游用自己的默认值，
+  // 避免对参数校验严格的接口因为多出来的字段整单 400
+  const wm = envBool(env.IMAGE_WATERMARK);
+  if (wm !== null) p.watermark = wm;
+
+  const pe = envBool(env.IMAGE_PROMPT_EXTEND);
+  if (pe !== null) p.prompt_extend = pe;
+
+  return p;
+}
+
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
 // tools: 可选，OpenAI 兼容的 tools 数组（Agent 模式用）；图片通道自动忽略
 function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
@@ -120,8 +155,11 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 
   const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
   const apiUrl = channel.url;
-  // 图片模型只认 images/generations 接口地址，不再按模型名猜测，避免误伤
-  const isImageAPI = apiUrl.includes('images/generations');
+  // 图片模型按接口路径判定，不再按模型名猜测，避免误伤。
+  // 走 URL 解析而不是裸 includes：带上查询串的地址也能判准。
+  let apiPath = apiUrl;
+  try { apiPath = new URL(apiUrl).pathname; } catch (e) {}
+  const isImageAPI = /\/images\/(generations|edits)(\/|$)/.test(apiPath) || apiUrl.includes('images/generations');
 
   // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
@@ -142,11 +180,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     }
   }
 
-  const payload = isImageAPI ? {
-    model: selectedModel,
-    prompt: lastPrompt,
-    n: 1
-  } : {
+  const payload = isImageAPI ? buildImagePayload(env, selectedModel, lastPrompt) : {
     model: selectedModel,
     // v6.9.0：只透传上游认识的标准字段。本地附加字段（如前端时间戳 t）
     // 不剥离的话，严格校验参数的上游会整单 400
@@ -168,4 +202,5 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 export {
   getChannelConfig,
   buildAIRequest,
+  buildImagePayload,
 };

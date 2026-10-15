@@ -305,6 +305,359 @@ async function main() {
     });
   }
 
+  console.log('\n=== 6. KV 绑定自动发现（"自动绑定"能自动到哪一步） ===');
+  const edgeStore = await import('../cloud-functions/_app/store/edge-store.js');
+
+  await checkAsync('识别规则：KV（有 put）为真，Blob Store（用 set）为假', () => {
+    assert.equal(edgeStore.looksLikeKvNamespace(fakeKvNamespace()), true);
+    assert.equal(edgeStore.looksLikeKvNamespace(fakeBlobStore()), false);
+    assert.equal(edgeStore.looksLikeKvNamespace(null), false);
+  });
+
+  await checkAsync('任意变量名绑定的 KV 都能被自动发现（无需 EO_KV_BINDING）', () => {
+    globalThis.MY_WEIRD_NAME_KV = fakeKvNamespace();
+    try {
+      const found = edgeStore.detectKvBinding({}, {});
+      assert.ok(found, '应发现 KV 绑定');
+      assert.equal(found.name, 'globalThis.MY_WEIRD_NAME_KV');
+    } finally {
+      delete globalThis.MY_WEIRD_NAME_KV;
+    }
+  });
+
+  await checkAsync('EO_KV_BINDING 显式指定时优先命中该名字', () => {
+    globalThis.KV_ALPHA = fakeKvNamespace();
+    globalThis.KV_BETA = fakeKvNamespace();
+    try {
+      const found = edgeStore.detectKvBinding({}, { EO_KV_BINDING: 'KV_BETA' });
+      assert.equal(found.name, 'globalThis.KV_BETA');
+    } finally {
+      delete globalThis.KV_ALPHA;
+      delete globalThis.KV_BETA;
+    }
+  });
+
+  await checkAsync('常见默认名 CHAT_KV 无需配置即可命中', () => {
+    globalThis.CHAT_KV = fakeKvNamespace();
+    try {
+      const found = edgeStore.detectKvBinding({}, {});
+      assert.equal(found.name, 'globalThis.CHAT_KV');
+    } finally {
+      delete globalThis.CHAT_KV;
+    }
+  });
+
+  await checkAsync('env.R2（本层挂载的替身）不会被误判成 KV 绑定', () => {
+    const env = { R2: blobBackend.makeBlobBackend(fakeBlobStore()) };
+    assert.equal(edgeStore.detectKvBinding({}, env), null);
+    assert.deepEqual(edgeStore.listKvCandidates({}, env), []);
+  });
+
+  await checkAsync('端到端：globalThis 上任意名字的 KV 被自动接管为 env.R2', async () => {
+    globalThis.SOME_RANDOM_KV_NAME = fakeKvNamespace();
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { STORAGE_BACKEND: 'kv' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.storage, 'kv(globalThis.SOME_RANDOM_KV_NAME)');
+    } finally {
+      delete globalThis.SOME_RANDOM_KV_NAME;
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('端到端：auto 模式下没有后端时退化为 memory（不抛错）', async () => {
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { STORAGE_BACKEND: 'auto' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.storage, 'memory');
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  console.log('\n=== 7. /healthz 排障输出 ===');
+  await checkAsync('STORAGE_DEBUG=1 时输出后端探测详情', async () => {
+    const res = await mod.handle({
+      request: new Request('https://example.com/healthz'),
+      env: { STORAGE_BACKEND: 'none', STORAGE_DEBUG: '1' },
+      waitUntil: () => {},
+    });
+    const j = await res.json();
+    assert.ok(j.debug, '应包含 debug 字段');
+    assert.equal(j.debug.backend, 'memory');
+    assert.ok(Array.isArray(j.debug.kvCandidates));
+    assert.ok(j.debug.hint.length > 0, '未接通时应给出提示');
+  });
+
+  await checkAsync('默认不输出排障详情（不对外暴露内部绑定名）', async () => {
+    const res = await call('/healthz');
+    const j = await res.json();
+    assert.equal(j.debug, undefined);
+  });
+
+  console.log('\n=== 8. 生图链路（SenseNova 日日新等图像接口） ===');
+  const images = await import('../cloud-functions/_app/images.js');
+  const channelMod = await import('../cloud-functions/_app/channel.js');
+  const IMG_BASE = '/api/img/';
+
+  async function sseTextOf(res) {
+    const txt = await res.text();
+    const m = txt.match(/^data: (.*)$/m);
+    assert.ok(m, 'SSE 里应有 data: 行');
+    return JSON.parse(m[1]).choices[0].delta.content;
+  }
+
+  await checkAsync('SenseNova 图像地址被判为图像接口，且默认显式要 url', () => {
+    const env = {
+      API_URL_1: 'https://token.sensenova.cn/v1/images/generations',
+      API_KEY_1: 'sk-test',
+      MODEL_1: 'sensenova-u1.5-fast:日日新 U1.5 Fast',
+    };
+    const cfg = channelMod.buildAIRequest(env, 'sensenova-u1.5-fast',
+      [{ role: 'user', content: '一只白色海豹宝宝' }], false);
+    assert.equal(cfg.isImageAPI, true);
+    assert.equal(cfg.payload.response_format, 'url', '必须显式要 url —— 上游默认 b64_json 就是丢图的根因');
+    assert.equal(cfg.payload.prompt, '一只白色海豹宝宝');
+    assert.equal(cfg.payload.n, 1);
+    assert.equal(cfg.payload.size, undefined, '未配置的可选参数不应发送');
+    assert.equal(cfg.payload.watermark, undefined);
+  });
+
+  await checkAsync('图像接口可选参数按环境变量透传', () => {
+    const env = {
+      API_URL_1: 'https://token.sensenova.cn/v1/images/generations',
+      API_KEY_1: 'sk-test',
+      MODEL_1: 'sensenova-u1.5-fast:日日新',
+      IMAGE_SIZE: '2048x2048',
+      IMAGE_OUTPUT_FORMAT: 'webp',
+      IMAGE_WATERMARK: 'false',
+      IMAGE_PROMPT_EXTEND: '0',
+      IMAGE_RESPONSE_FORMAT: 'b64_json',
+    };
+    const cfg = channelMod.buildAIRequest(env, 'sensenova-u1.5-fast', [{ role: 'user', content: 'x' }], false);
+    assert.equal(cfg.payload.size, '2048x2048');
+    assert.equal(cfg.payload.output_format, 'webp');
+    assert.equal(cfg.payload.watermark, false);
+    assert.equal(cfg.payload.prompt_extend, false);
+    assert.equal(cfg.payload.response_format, 'b64_json');
+  });
+
+  await checkAsync('普通 chat 通道不会被误判为图像接口', () => {
+    const env = {
+      API_URL_1: 'https://api.deepseek.com/v1/chat/completions',
+      API_KEY_1: 'sk-test',
+      MODEL_1: 'deepseek-chat:DeepSeek Chat',
+    };
+    const cfg = channelMod.buildAIRequest(env, 'deepseek-chat', [{ role: 'user', content: 'hi' }], true);
+    assert.equal(cfg.isImageAPI, false);
+    assert.equal(cfg.payload.prompt, undefined);
+    assert.equal(cfg.payload.response_format, undefined);
+  });
+
+  await checkAsync('base64 编解码往返（含非 ASCII 字节）', () => {
+    const bytes = new Uint8Array([0, 1, 127, 128, 200, 255, 89, 137, 80, 78, 71]);
+    assert.deepEqual(Array.from(images.base64ToBytes(images.bytesToBase64(bytes))), Array.from(bytes));
+    assert.equal(images.bytesToBase64(new Uint8Array([0])), 'AA==');
+    assert.equal(images.bytesToBase64(new Uint8Array([255, 255, 255])), '////');
+    assert.equal(images.base64ToBytes('').length, 0);
+  });
+
+  const imgEnv = { R2: blobBackend.makeBlobBackend(fakeBlobStore()) };
+
+  await checkAsync('base64 图片转存后可读回（字节与 content-type 都正确）', async () => {
+    const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
+    const path = await images.persistBase64Image(imgEnv, images.bytesToBase64(bytes), 'image/png');
+    assert.ok(path && path.indexOf(IMG_BASE) === 0, '应返回 /api/img/<id>');
+    const got = await images.loadStoredImage(imgEnv, path.slice(IMG_BASE.length));
+    assert.ok(got, '应能读回');
+    assert.equal(got.contentType, 'image/png');
+    assert.deepEqual(Array.from(got.bytes), Array.from(bytes));
+  });
+
+  await checkAsync('未绑定存储时转存返回 null（调用方回退，不抛错）', async () => {
+    assert.equal(await images.persistBase64Image({}, 'AAAA', 'image/png'), null);
+    assert.equal(await images.persistRemoteImage({}, 'https://cdn.example.com/a.png', 1000), null);
+  });
+
+  await checkAsync('图片 id 路径穿越与非法形态被拒绝', async () => {
+    assert.equal(await images.loadStoredImage(imgEnv, '../../etc/passwd'), null);
+    assert.equal(await images.loadStoredImage(imgEnv, 'a.png'), null);
+    assert.equal(await images.loadStoredImage(imgEnv, 'aa-11.png/../../x'), null);
+  });
+
+  await checkAsync('上游 URL 图片会被下载转存', async () => {
+    const realFetch = globalThis.fetch;
+    const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 9, 9]);
+    globalThis.fetch = async () => new Response(png, { headers: { 'content-type': 'image/png' } });
+    try {
+      const path = await images.persistRemoteImage(imgEnv, 'https://cdn.example.com/a.png', 5000);
+      assert.ok(path && path.indexOf(IMG_BASE) === 0);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  await checkAsync('非图片内容类型拒收（避免把错误页当图片存下来）', async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('<html>err</html>', { headers: { 'content-type': 'text/html' } });
+    try {
+      assert.equal(await images.persistRemoteImage(imgEnv, 'https://cdn.example.com/err.html', 5000), null);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  await checkAsync('内网 / 云元数据图片地址被 SSRF 拦截且不发起请求', async () => {
+    const realFetch = globalThis.fetch;
+    let called = false;
+    globalThis.fetch = async () => { called = true; return new Response('x'); };
+    try {
+      assert.equal(await images.persistRemoteImage(imgEnv, 'http://127.0.0.1/a.png', 5000), null);
+      assert.equal(await images.persistRemoteImage(imgEnv, 'http://169.254.169.254/latest/meta-data/', 5000), null);
+      assert.equal(await images.persistRemoteImage(imgEnv, 'file:///etc/passwd', 5000), null);
+      assert.equal(called, false, '被拦截的地址不应真的发起请求');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  await checkAsync('b64_json 响应能解析成图片（原实现正是在这里丢图）', async () => {
+    const b64 = images.bytesToBase64(new Uint8Array([137, 80, 78, 71, 1, 2, 3, 4]));
+    const upstream = new Response(JSON.stringify({ created: 1, data: [{ b64_json: b64 }] }),
+      { headers: { 'content-type': 'application/json' } });
+    const content = await sseTextOf(await images.buildImageSseResponse(imgEnv, upstream));
+    assert.match(content, /!\[生成结果\]\(\/api\/img\//, '应转存并给出 /api/img 链接');
+  });
+
+  await checkAsync('url 响应会被下载转存成自有长期链接', async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(new Uint8Array([137, 80, 78, 71, 5, 6]),
+      { headers: { 'content-type': 'image/png' } });
+    try {
+      const upstream = new Response(JSON.stringify({ data: [{ url: 'https://cdn.sensenova.dev/gen/x.png' }] }),
+        { headers: { 'content-type': 'application/json' } });
+      const content = await sseTextOf(await images.buildImageSseResponse(imgEnv, upstream));
+      assert.match(content, /\(\/api\/img\//);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  await checkAsync('IMAGE_PERSIST=0 时保留上游链接并明确提示 24 小时失效', async () => {
+    const env = { R2: imgEnv.R2, IMAGE_PERSIST: '0' };
+    const upstream = new Response(JSON.stringify({ data: [{ url: 'https://cdn.sensenova.dev/gen/y.png' }] }),
+      { headers: { 'content-type': 'application/json' } });
+    const content = await sseTextOf(await images.buildImageSseResponse(env, upstream));
+    assert.match(content, /https:\/\/cdn\.sensenova\.dev\/gen\/y\.png/);
+    assert.match(content, /24 小时/);
+  });
+
+  await checkAsync('多张图片逐个转存并带序号', async () => {
+    const b64a = images.bytesToBase64(new Uint8Array([1, 2, 3]));
+    const b64b = images.bytesToBase64(new Uint8Array([4, 5, 6]));
+    const upstream = new Response(JSON.stringify({ data: [{ b64_json: b64a }, { b64_json: b64b }] }),
+      { headers: { 'content-type': 'application/json' } });
+    const content = await sseTextOf(await images.buildImageSseResponse(imgEnv, upstream));
+    assert.match(content, /生成结果 1/);
+    assert.match(content, /生成结果 2/);
+  });
+
+  await checkAsync('图像接口报错时把上游原因透传给用户', async () => {
+    const upstream = new Response(JSON.stringify({ error: { message: 'quota exceeded' } }),
+      { headers: { 'content-type': 'application/json' } });
+    assert.match(await sseTextOf(await images.buildImageSseResponse(imgEnv, upstream)), /quota exceeded/);
+  });
+
+  await checkAsync('返回里既无 url 也无 b64_json 时给出原始响应片段', async () => {
+    const upstream = new Response(JSON.stringify({ data: [{ revised_prompt: 'x' }] }),
+      { headers: { 'content-type': 'application/json' } });
+    assert.match(await sseTextOf(await images.buildImageSseResponse(imgEnv, upstream)), /未返回任何图片/);
+  });
+
+  await checkAsync('上游返回非 JSON 时给出可读错误而不是崩掉', async () => {
+    const upstream = new Response('<html>502 Bad Gateway</html>', { headers: { 'content-type': 'text/html' } });
+    assert.match(await sseTextOf(await images.buildImageSseResponse(imgEnv, upstream)), /不是合法 JSON/);
+  });
+
+  await checkAsync('端到端：GET /api/img/<id> 经完整路由取回图片字节', async () => {
+    globalThis.E2E_IMG_KV = fakeKvNamespace();
+    edgeStore.__resetForTest();
+    try {
+      const backend = kvBackend.makeKvBackend(globalThis.E2E_IMG_KV);
+      const bytes = new Uint8Array([137, 80, 78, 71, 99, 100, 101]);
+      const path = await images.persistBase64Image({ R2: backend }, images.bytesToBase64(bytes), 'image/png');
+      assert.ok(path, '应先转存成功');
+      const res = await mod.handle({
+        request: new Request('https://example.com' + path),
+        env: { STORAGE_BACKEND: 'kv' },
+        waitUntil: () => {},
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('Content-Type'), 'image/png');
+      assert.match(res.headers.get('Cache-Control'), /immutable/);
+      assert.deepEqual(Array.from(new Uint8Array(await res.arrayBuffer())), Array.from(bytes));
+    } finally {
+      delete globalThis.E2E_IMG_KV;
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('GET /api/img/<不存在的 id> 返回 404', async () => {
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/api/img/abcdefgh-12345678.png'),
+        env: { STORAGE_BACKEND: 'none' },
+        waitUntil: () => {},
+      });
+      assert.equal(res.status, 404);
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  console.log('\n=== 9. 生成页面本身的合法性 ===');
+  // ui/*.js 导出的都是模板字符串，改动很容易因为两层转义把页面脚本写坏，
+  // 而那种错误在服务端完全看不出来（只有浏览器打开才炸）。这里把内联脚本抽出来单独 parse。
+  const uiMod = await import('../cloud-functions/_app/ui/index.js');
+  const pageHtml = uiMod.HTML_CONTENT;
+
+  await checkAsync('页面 HTML 能生成且包含模型下拉框占位符', () => {
+    assert.ok(pageHtml.length > 50000, 'HTML 长度异常');
+    assert.match(pageHtml, /\{\{MODEL_OPTIONS\}\}/);
+  });
+
+  await checkAsync('页面内联脚本块全部语法合法（两层转义没写坏）', () => {
+    const re = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g;
+    let m;
+    let n = 0;
+    while ((m = re.exec(pageHtml)) !== null) {
+      const code = m[1];
+      if (!code.trim()) continue;
+      n++;
+      // new Function 只做解析不执行，足以抓出语法/转义错误
+      // eslint-disable-next-line no-new-func
+      new Function(code);
+    }
+    assert.ok(n > 0, '应至少有一个内联脚本块');
+  });
+
+  await checkAsync('生图相关的前端改动都已生效', () => {
+    assert.match(pageHtml, /renderer\.image\s*=\s*function/, '缺少图片渲染器');
+    assert.match(pageHtml, /\.md-img-link/, '缺少图片链接样式');
+    assert.match(pageHtml, /内联图片过大，已省略/, '缺少 localStorage 配额兜底');
+  });
+
   console.log('\n=== 结果 ===');
   console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
   if (fail > 0) process.exit(1);

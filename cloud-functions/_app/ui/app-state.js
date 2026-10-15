@@ -93,7 +93,15 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
           sessions[i].messages = msgs.slice(msgs.length - MAX_STORE_MSGS);
         }
       }
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+      var payload = JSON.stringify(sessions);
+      try {
+        localStorage.setItem(STORAGE_KEY, payload);
+      } catch (quotaErr) {
+        // 配额溢出：最可能是某条消息里内联了 base64 图片（图像接口直接返回 b64 时会走到这条路）。
+        // 退一步——把内联图片替换成占位说明后重试，宁可丢这一张图，也不能让整份会话写不进去。
+        var INLINE_IMG_RE = new RegExp('data:image/[a-z+]+;base64,[A-Za-z0-9+/=]+', 'g');
+        localStorage.setItem(STORAGE_KEY, payload.replace(INLINE_IMG_RE, '[内联图片过大，已省略]'));
+      }
     } catch (e) {}
   }
 

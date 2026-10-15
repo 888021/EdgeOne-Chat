@@ -8,7 +8,7 @@
 //   4) /healthz 额外返回当前生效的存储后端，便于线上排障。
 
 import { CORS_HEADERS, TEXT_HEADERS, HTML_HEADERS, SSE_HEADERS, PNG_HEADERS,
-  MANIFEST_HEADERS, SW_HEADERS, HEALTH_HEADERS, APP_VERSION } from './constants.js';
+  MANIFEST_HEADERS, SW_HEADERS, HEALTH_HEADERS, APP_VERSION, imgHeaders } from './constants.js';
 import { denyUnauthorized } from './auth.js';
 import { hitRateLimit } from './rate-limit.js';
 import { getChannelConfig, buildAIRequest } from './channel.js';
@@ -20,7 +20,8 @@ import { MANIFEST_JSON } from './pwa/manifest.js';
 import { SW_JS } from './pwa/service-worker.js';
 import { getPwaVersion } from './pwa/version.js';
 import { HTML_CONTENT } from './ui/index.js';
-import { resolveStore, activeBackendName } from './store/edge-store.js';
+import { resolveStore, activeBackendName, storageDiagnostics } from './store/edge-store.js';
+import { loadStoredImage, buildImageSseResponse, IMG_URL_PATH } from './images.js';
 
 // 把 EdgeOne 的 context.env 包一层，在保留原有全部环境变量的同时，
 // 额外提供 env.R2（存储替身）。用 Proxy 而不是对象展开，是为了不丢失
@@ -77,14 +78,29 @@ async function routeRequest(request, env, ctx) {
     // 健康探针：供前端与 Service Worker 判断服务端是否可达。
     // ⚠️ SW 中必须显式放行该路径且绝不缓存，否则探针会被缓存应答 →
     //    永远「探测成功」→ 自动重连逻辑形同虚设。
-    // 额外返回 storage 字段：blob / kv / memory，方便一眼看出持久化是否真的接上了。
+    // 额外返回 storage 字段：blob:xxx / kv(xxx) / memory，一眼看出持久化是否真的接上了。
+    // 设 STORAGE_DEBUG=1 时会附带后端探测详情（Blob 引入报错、发现的 KV 绑定名等），便于排障。
     if (request.method === 'GET' && url.pathname === '/healthz') {
-      return new Response(JSON.stringify({
+      const payload = {
         ok: true,
         t: Date.now(),
         runtime: 'edgeone',
         storage: activeBackendName() || 'memory',
-      }), { headers: HEALTH_HEADERS });
+      };
+      if (env && env.STORAGE_DEBUG === '1') {
+        try { payload.debug = storageDiagnostics(ctx && ctx.__context, env); } catch (e) {}
+      }
+      return new Response(JSON.stringify(payload), { headers: HEALTH_HEADERS });
+    }
+
+    // 生图结果：转存后的图片通过这里回给浏览器。
+    // 公开访问（<img src> 没法带自定义头），所以靠随机且不可枚举的 id 做保护，
+    // 并严格校验 id 形态杜绝路径穿越。
+    if (request.method === 'GET' && url.pathname.startsWith(IMG_URL_PATH)) {
+      const id = url.pathname.slice(IMG_URL_PATH.length);
+      const img = await loadStoredImage(env, id);
+      if (!img) return new Response('Not Found', { status: 404 });
+      return new Response(img.bytes, { headers: imgHeaders(img.contentType) });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
@@ -139,26 +155,11 @@ async function routeRequest(request, env, ctx) {
         if (!isImageAPI) {
           return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
         } else {
-          const responseData = await upstreamResponse.json();
-          let imageUrlOrText = "图片生成失败或未返回格式";
-
-          if (responseData.data && responseData.data[0]?.url) {
-            imageUrlOrText = `![生成结果](${responseData.data[0].url})`;
-          } else if (responseData.choices && responseData.choices[0]?.message) {
-            imageUrlOrText = responseData.choices[0].message.content;
-          }
-
-          const encoder = new TextEncoder();
-          const stream = new ReadableStream({
-            start(controller) {
-              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
-              controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-              controller.close();
-            }
-          });
-
-          return new Response(stream, { headers: SSE_HEADERS });
+          // 图像接口的响应体不是 chat 流，需要单独解析：
+          // 兼容 data[].url、data[].b64_json（SenseNova 默认返回方式）以及
+          // 少数把图片塞在 choices[].message.content 里的网关。
+          // 拿到的图片统一转存到自有存储，返回 /api/img/<id> 长期链接。
+          return await buildImageSseResponse(env, upstreamResponse);
         }
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
@@ -223,7 +224,8 @@ async function handle(context) {
 
   let store = null;
   try {
-    store = await resolveStore(rawEnv);
+    // 传入 context 是为了让存储层能在 env / context / globalThis 三处自动发现 KV 绑定
+    store = await resolveStore(context, rawEnv);
   } catch (e) {
     store = null;
   }
@@ -236,6 +238,8 @@ async function handle(context) {
       } catch (e) {}
       return undefined;
     },
+    // EdgeOne 原始 context：仅供存储层自动发现 KV 绑定与 /healthz 排障输出使用
+    __context: context,
   };
 
   const res = await routeRequest(request, env, ctx);

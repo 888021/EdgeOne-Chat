@@ -52,6 +52,16 @@ const HEALTH_HEADERS = {
   'Access-Control-Allow-Origin': '*',
 };
 
+// 生图结果转存后的读图响应头。图片按内容寻址（id 唯一且不可变），可以长缓存。
+// 这里必须允许 CORS：前端可能把图片渲染在 <img> 之外的场景（如另存、画布处理）。
+function imgHeaders(contentType) {
+  return {
+    'Content-Type': contentType || 'image/png',
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'Access-Control-Allow-Origin': '*',
+  };
+}
+
 export {
   CORS_HEADERS,
   SSE_HEADERS,
@@ -62,4 +72,5 @@ export {
   SW_HEADERS,
   HEALTH_HEADERS,
   APP_VERSION,
+  imgHeaders,
 };
