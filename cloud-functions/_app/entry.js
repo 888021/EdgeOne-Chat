@@ -20,7 +20,7 @@ import { MANIFEST_JSON } from './pwa/manifest.js';
 import { SW_JS } from './pwa/service-worker.js';
 import { getPwaVersion } from './pwa/version.js';
 import { HTML_CONTENT } from './ui/index.js';
-import { resolveStore, activeBackendName, storageDiagnostics } from './store/edge-store.js';
+import { resolveStore, activeBackendName, storageDiagnostics, probeStore } from './store/edge-store.js';
 import { loadStoredImage, buildImageSseResponse, IMG_URL_PATH } from './images.js';
 
 // 把 EdgeOne 的 context.env 包一层，在保留原有全部环境变量的同时，
@@ -88,7 +88,14 @@ async function routeRequest(request, env, ctx) {
         storage: activeBackendName() || 'memory',
       };
       if (env && env.STORAGE_DEBUG === '1') {
-        try { payload.debug = storageDiagnostics(ctx && ctx.__context, env); } catch (e) {}
+        const debug = {};
+        try { Object.assign(debug, storageDiagnostics(ctx && ctx.__context, env)); } catch (e) {}
+        // ?probe=1 会真实写入并读回一个临时对象，用来确认存储「真的能用」
+        // （getStore() 成功只代表 SDK 加载了，不代表有权限/有配额）
+        if (url.searchParams.get('probe') === '1') {
+          try { debug.probe = await probeStore(); } catch (e) {}
+        }
+        payload.debug = debug;
       }
       return new Response(JSON.stringify(payload), { headers: HEALTH_HEADERS });
     }

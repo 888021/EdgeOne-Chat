@@ -385,6 +385,77 @@ async function main() {
     }
   });
 
+  console.log('\n=== 6b. Blob 默认后端（"使用 Blob 存储"） ===');
+
+  await checkAsync('识别规则：Blob Store（用 set，无 put）为真，KV 为假', () => {
+    assert.equal(edgeStore.looksLikeBlobStore(fakeBlobStore()), true);
+    assert.equal(edgeStore.looksLikeBlobStore(fakeKvNamespace()), false);
+    assert.equal(edgeStore.looksLikeBlobStore(null), false);
+    // 本层自己挂载的 env.R2 替身同样带 list/delete，但它有 put，不能被当成 Blob Store
+    assert.equal(edgeStore.looksLikeBlobStore(blobBackend.makeBlobBackend(fakeBlobStore())), false);
+  });
+
+  await checkAsync('未设置 STORAGE_BACKEND 时默认走 Blob，绝不静默降级到 KV', async () => {
+    // 故意在 globalThis 上放一个可用的 KV：旧行为（auto）会用它兜底，
+    // 新行为必须无视它 —— Blob 不可用就如实报 memory，而不是偷偷换后端。
+    globalThis.CHAT_KV = fakeKvNamespace();
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: {},
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.storage, 'memory', '默认后端是 Blob；Blob 不可用时应暴露为 memory');
+    } finally {
+      delete globalThis.CHAT_KV;
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('任意变量名绑定的 Blob 都能被自动发现（无需 EO_BLOB_BINDING）', () => {
+    globalThis.MY_WEIRD_BLOB = fakeBlobStore();
+    try {
+      const found = edgeStore.detectBlobBinding({}, {});
+      assert.ok(found, '应发现 Blob 绑定');
+      assert.equal(found.name, 'globalThis.MY_WEIRD_BLOB');
+    } finally {
+      delete globalThis.MY_WEIRD_BLOB;
+    }
+  });
+
+  await checkAsync('EO_BLOB_BINDING 显式指定时优先命中该名字', () => {
+    globalThis.BLOB_ALPHA = fakeBlobStore();
+    globalThis.BLOB_BETA = fakeBlobStore();
+    try {
+      const found = edgeStore.detectBlobBinding({}, { EO_BLOB_BINDING: 'BLOB_BETA' });
+      assert.equal(found.name, 'globalThis.BLOB_BETA');
+    } finally {
+      delete globalThis.BLOB_ALPHA;
+      delete globalThis.BLOB_BETA;
+    }
+  });
+
+  await checkAsync('端到端：控制台绑定的 Blob 被接管为 env.R2，且真的能写能读', async () => {
+    const bound = fakeBlobStore();
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        // ?probe=1 会真实写入并读回一个临时对象 —— 这一步才证明存储「能用」而不只是「能加载」
+        request: new Request('https://example.com/healthz?probe=1'),
+        env: { BLOB: bound, STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.storage, 'blob(env.BLOB)', '应优先使用控制台绑定的那个命名空间');
+      assert.equal(j.debug.blobBindingUsed, 'env.BLOB');
+      assert.equal(j.debug.probe.ok, true, '真实读写应成功');
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
   console.log('\n=== 7. /healthz 排障输出 ===');
   await checkAsync('STORAGE_DEBUG=1 时输出后端探测详情', async () => {
     const res = await mod.handle({
@@ -403,6 +474,73 @@ async function main() {
     const res = await call('/healthz');
     const j = await res.json();
     assert.equal(j.debug, undefined);
+  });
+
+  await checkAsync('排障输出回显后端模式与命名空间（默认 blob）', async () => {
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.debug.mode, 'blob', '未设置 STORAGE_BACKEND 时应回显默认值 blob');
+      assert.equal(j.debug.namespace, 'cloudflare-chat');
+      assert.equal(j.debug.blobBindingUsed, null);
+      assert.ok(Array.isArray(j.debug.blobCandidates));
+      assert.equal(j.debug.warning, undefined, '合法取值不应有 warning');
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('STORAGE_BACKEND 拼错时按 blob 处理并明确给出 warning', async () => {
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { STORAGE_BACKEND: 'bolb', STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.debug.mode, 'bolb', '应原样回显，方便发现拼写错误');
+      assert.match(j.debug.warning, /无法识别/);
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('?probe=1 在存储未接通时明确报 ok:false 并给出原因', async () => {
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz?probe=1'),
+        env: { STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.debug.probe.ok, false);
+      assert.match(j.debug.probe.reason, /未接通/);
+    } finally {
+      edgeStore.__resetForTest();
+    }
+  });
+
+  await checkAsync('不加 ?probe=1 时不会做真实读写（避免每次探针都产生写操作）', async () => {
+    const bound = fakeBlobStore();
+    edgeStore.__resetForTest();
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/healthz'),
+        env: { BLOB: bound, STORAGE_DEBUG: '1' },
+        waitUntil: () => {},
+      });
+      const j = await res.json();
+      assert.equal(j.debug.probe, undefined);
+    } finally {
+      edgeStore.__resetForTest();
+    }
   });
 
   console.log('\n=== 8. 生图链路（SenseNova 日日新等图像接口） ===');
