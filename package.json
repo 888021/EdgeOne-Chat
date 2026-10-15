@@ -1,0 +1,17 @@
+{
+  "name": "cloudflare-chat-edgeone",
+  "version": "7.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare-Chat 的腾讯云 EdgeOne 移植版：EdgeOne Makers Cloud Functions (Node.js) + Blob 存储",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "edgeone pages dev",
+    "selfcheck": "node scripts/selfcheck.mjs"
+  },
+  "dependencies": {
+    "@edgeone/pages-blob": "^0.0.18"
+  }
+}
