@@ -148,7 +148,7 @@ MODEL_1   = sensenova-u1.5-fast:日日新 U1.5 Fast
 |---|---|---|
 | `IMAGE_PERSIST` | `1` | 是否转存到自己存储。设 `0` 则直接用上游链接（省存储，但 24 小时后失效） |
 | `IMAGE_MAX_MB` | `8` | 单张转存上限，超过则退回上游链接 |
-| `IMAGE_TIMEOUT_MS` | `20000` | 下载上游图片的超时 |
+| `IMAGE_TIMEOUT_MS` | `600000` | 下载上游图片的超时 |
 | `IMAGE_RESPONSE_FORMAT` | `url` | 请求上游时的 `response_format` |
 | `IMAGE_SIZE` | 不发送 | 如 `2048x2048`（32 的倍数，512~4096，比例 ≤ 3:1） |
 | `IMAGE_OUTPUT_FORMAT` | 不发送 | `png` / `jpeg` / `webp` |
