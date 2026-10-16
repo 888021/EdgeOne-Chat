@@ -13,7 +13,7 @@
 // 相关环境变量：
 //   IMAGE_PERSIST        1（默认）/ 0 —— 是否把图片转存到自己的存储
 //   IMAGE_MAX_MB         单张图片转存上限，默认 8（超过则退回上游原始链接）
-//   IMAGE_TIMEOUT_MS     下载上游图片的超时，默认 600000（10 分钟）
+//   IMAGE_TIMEOUT_MS     下载上游图片的超时，默认 20000
 //   IMAGE_RESPONSE_FORMAT  请求上游时的 response_format，默认 url
 //   IMAGE_SIZE / IMAGE_OUTPUT_FORMAT / IMAGE_WATERMARK / IMAGE_PROMPT_EXTEND
 //                        透传给图像接口的可选参数，不设则不发送（用上游默认值）
@@ -25,7 +25,7 @@ import { SSE_HEADERS } from './constants.js';
 const IMG_PREFIX = 'img/';
 const IMG_URL_PATH = '/api/img/';
 const DEFAULT_MAX_MB = 8;
-const DEFAULT_TIMEOUT_MS = 600000;
+const DEFAULT_TIMEOUT_MS = 20000;
 
 const EXT_BY_MIME = {
   'image/png': 'png',
