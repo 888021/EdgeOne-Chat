@@ -25,7 +25,7 @@ import { SSE_HEADERS } from './constants.js';
 const IMG_PREFIX = 'img/';
 const IMG_URL_PATH = '/api/img/';
 const DEFAULT_MAX_MB = 8;
-const DEFAULT_TIMEOUT_MS = 20000;
+const DEFAULT_TIMEOUT_MS = 600000;
 
 const EXT_BY_MIME = {
   'image/png': 'png',
