@@ -93,64 +93,6 @@ function tail(s, n) {
   return str.length > n ? '…' + str.slice(-n) : str;
 }
 
-// ---------- 公开基址推导 ----------
-// 为什么不能只用 url.origin：
-//   EdgeOne 在边缘终止 TLS，再以**明文 http** 内部转发给函数，于是函数拿到的
-//   request.url 协议恒为 http —— 即使访客走的是 https。
-//   直接把 http 地址交给 Telegram 会被拒绝：
-//     400 Bad Request: bad webhook: HTTPS url must be provided for webhook
-//   这正是「一键绑定报错 / 机器人永远不说话」的根因。所以这里按三层顺序推导，
-//   并把「地址是从哪来的」如实回显（baseSource），方便一眼看出问题出在哪一层。
-
-// 本地/回环地址不做 https 升级，避免影响本地调试
-function hostIsLocal(host) {
-  const h = String(host || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
-  return /^(localhost|127\.\d+\.\d+\.\d+|::1|0\.0\.0\.0)$/i.test(h);
-}
-
-function firstHeaderValue(v) {
-  return String(v === undefined || v === null ? '' : v).split(',')[0].trim();
-}
-
-function headerOf(request, name) {
-  try {
-    return request && request.headers ? request.headers.get(name) : null;
-  } catch (e) { return null; }
-}
-
-function derivePublicBase(request, url, env) {
-  // 1) 显式配置最高优先：自定义域名 / 反代场景下，请求 origin 未必是对外域名。
-  const explicit = String((env && env.TG_PUBLIC_BASE_URL) || '').trim();
-  if (explicit) {
-    return { base: explicit.replace(/\/+$/, ''), source: 'env:TG_PUBLIC_BASE_URL' };
-  }
-
-  // 2) 反代头优先：X-Forwarded-Proto 记录的是「访客真实使用的协议」，
-  //    比函数看到的内部协议更可信。Host 同理。
-  const fwdProto = firstHeaderValue(
-    headerOf(request, 'X-Forwarded-Proto')
-    || headerOf(request, 'X-Forwarded-Scheme')
-    || headerOf(request, 'X-Url-Scheme')
-  ).toLowerCase();
-  const fwdHost = firstHeaderValue(headerOf(request, 'X-Forwarded-Host') || headerOf(request, 'Host'))
-    || String(url.host || '');
-
-  let scheme = (fwdProto === 'https' || fwdProto === 'http')
-    ? fwdProto
-    : String(url.protocol || 'http:').replace(/:$/, '');
-  let source = fwdProto ? 'derived:forwarded-proto' : 'derived:request-url';
-
-  // 3) 兜底升级：平台内部用 http 转发、而访客实际走的是 https（EdgeOne 就是如此）。
-  //    Telegram 只接受 https —— 与其把 http 地址送上去被 400 拒绝，
-  //    不如升到 https，并在报告里明确标注「已升级」，不静默。
-  if (scheme === 'http' && fwdHost && !hostIsLocal(fwdHost)) {
-    scheme = 'https';
-    source = 'derived:upgraded-http-to-https';
-  }
-
-  return { base: scheme + '://' + fwdHost, source: source };
-}
-
 export async function handleTgSetup(request, env, url) {
   const e = env || {};
   const key = e.TG_SETUP_KEY || e.TG_WEBHOOK_SECRET || '';
@@ -172,14 +114,11 @@ export async function handleTgSetup(request, env, url) {
   const action = String(url.searchParams.get('action') || 'status').toLowerCase();
   const drop = url.searchParams.get('drop') === '1';
 
-  // 公开地址推导：优先显式配置，其次反代头，最后才退回请求 URL（详见 derivePublicBase）。
-  // 注：在 EdgeOne 上 url.origin 恒为 http —— 函数收到的是边缘转发过来的明文请求。
+  // 公开地址推导：优先用显式配置（自定义域名 / 反代场景 origin 可能不是对外域名），
+  // 否则用本次请求的 origin。两者不一致时会在下方给出提示。
   const derivedBase = String(url.origin || '').replace(/\/+$/, '');
-  const pub = derivePublicBase(request, url, e);
-  const base = pub.base;
+  const base = String(e.TG_PUBLIC_BASE_URL || derivedBase).replace(/\/+$/, '');
   const hookUrl = base + '/tg-webhook';
-  // Telegram 只接受 HTTPS 回调地址；这里提前判定，好让报告直接指出这个硬阻塞
-  const hookIsHttps = /^https:\/\//i.test(hookUrl);
 
   const token = e.TG_BOT_TOKEN || '';
   const tokenInfo = describeToken(token);
@@ -195,12 +134,8 @@ export async function handleTgSetup(request, env, url) {
     storage: activeBackendName() || 'memory',
     base: base,
     origin: derivedBase,
-    // 地址是怎么推导出来的：env:TG_PUBLIC_BASE_URL / derived:forwarded-proto /
-    // derived:upgraded-http-to-https / derived:request-url
-    baseSource: pub.source,
     usingCustomBase: !!e.TG_PUBLIC_BASE_URL,
     webhookUrl: hookUrl,
-    webhookUrlIsHttps: hookIsHttps,
     bot: tokenInfo,
   };
 
@@ -329,21 +264,6 @@ function buildHints(e, out, allowedIds, models) {
       + 'token 无效或已被撤销，请到 @BotFather 用 /mybots 重新签发。');
   }
 
-  // 地址不是 https 是「绑定必然失败」的硬阻塞：Telegram 只接受 HTTPS 回调地址。
-  // 这一条放在 webhook 状态检查之前 —— 它是根因，后面的 no_webhook 只是结果。
-  if (out.webhookUrlIsHttps === false) {
-    push('fatal', 'webhook_not_https',
-      'webhook 地址不是 HTTPS：「' + out.webhookUrl + '」。'
-      + 'Telegram 只接受 HTTPS 回调地址，setWebhook 会返回 400'
-      + '（bad webhook: HTTPS url must be provided for webhook）。'
-      + '请先为该域名配置 SSL 证书，并显式设置 TG_PUBLIC_BASE_URL=https://<你的域名>。');
-  } else if (out.baseSource === 'derived:upgraded-http-to-https') {
-    push('info', 'base_auto_upgraded',
-      '平台把请求以明文 http 转发给函数（EdgeOne 在边缘终止 TLS 后就是如此），'
-      + '已自动把 webhook 地址升级为 HTTPS：' + out.base + '。'
-      + '建议显式设置 TG_PUBLIC_BASE_URL=https://<你的域名>，以免依赖该推断。');
-  }
-
   const wi = out.webhook || {};
   if (wi.registeredUrl === '' || wi.registeredUrl === undefined) {
     push('fatal', 'no_webhook',
@@ -357,32 +277,11 @@ function buildHints(e, out, allowedIds, models) {
       + '否则 Telegram 的请求根本没打到这里。');
   }
   if (wi.lastErrorMessage) {
-    const errMsg = String(wi.lastErrorMessage);
-    // TLS 类失败必须单独讲清楚：它和 403/secret 完全是两回事，且根因在「域名证书」，
-    // 改后端代码或换 secret 都毫无帮助。归到通用的 last_error 会把人带偏，所以单列一类。
-    if (/ssl|tls|certificate|handshake/i.test(errMsg)) {
-      let errHost = '';
-      try { errHost = new URL(wi.registeredUrl || out.webhookUrl || '').host; } catch (err) { errHost = ''; }
-      push('fatal', 'ssl_verify_failed',
-        'Telegram 能连到你的域名，但 TLS 证书校验没通过：' + errMsg
-        + (wi.lastErrorDate ? '（' + new Date(wi.lastErrorDate * 1000).toISOString() + '）' : '')
-        + '。OpenSSL 的 certificate verify failed（0A000086）几乎总是这三种之一：'
-        + '① 证书已过期；② 证书链不完整（服务端没下发中间证书）；③ 用了自签名或私有 CA 证书。'
-        + (errHost
-          ? '自查：openssl s_client -connect ' + errHost + ':443 -servername ' + errHost
-            + '，看「Verify return code」是否为 0、以及 notAfter 是否已经过去。'
-          : '')
-        + '注意：若你用的是 EdgeOne 默认共享域名（*.pages-scf-*.qcloudteo.com），'
-        + '证书由平台签发，过期或不受信时你无法自行更换 —— 请绑定自定义域名并申请免费 SSL 证书，'
-        + '然后设置 TG_PUBLIC_BASE_URL=https://<你的域名> 并重跑 action=set。'
-        + '（这个失败与 TG_WEBHOOK_SECRET 无关，改 secret 不会有帮助。）');
-    } else {
-      push('fatal', 'last_error',
-        'Telegram 最近一次投递失败：' + errMsg
-        + (wi.lastErrorDate ? '（' + new Date(wi.lastErrorDate * 1000).toISOString() + '）' : '')
-        + '。常见含义：403 Forbidden = 你设了 secret_token 但后端校验不通过（或没设却校验了）；'
-        + 'Wrong response from the webhook = 后端返回了非 2xx，请直接 curl 一下 /tg-webhook 看状态码。');
-    }
+    push('fatal', 'last_error',
+      'Telegram 最近一次投递失败：' + wi.lastErrorMessage
+      + (wi.lastErrorDate ? '（' + new Date(wi.lastErrorDate * 1000).toISOString() + '）' : '')
+      + '。常见含义：403 Forbidden = 你设了 secret_token 但后端校验不通过（或没设却校验了）；'
+      + 'Wrong response from the webhook = 后端返回了非 2xx，请直接 curl 一下 /tg-webhook 看状态码。');
   }
   if (wi.lastSynchronizationErrorDate) {
     push('fatal', 'sync_error', 'Telegram 连不上你的 webhook 地址（同步失败）。请确认域名已生效、路径是 /tg-webhook、且没有被访问控制挡住。');
