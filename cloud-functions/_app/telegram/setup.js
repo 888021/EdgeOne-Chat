@@ -357,11 +357,32 @@ function buildHints(e, out, allowedIds, models) {
       + '否则 Telegram 的请求根本没打到这里。');
   }
   if (wi.lastErrorMessage) {
-    push('fatal', 'last_error',
-      'Telegram 最近一次投递失败：' + wi.lastErrorMessage
-      + (wi.lastErrorDate ? '（' + new Date(wi.lastErrorDate * 1000).toISOString() + '）' : '')
-      + '。常见含义：403 Forbidden = 你设了 secret_token 但后端校验不通过（或没设却校验了）；'
-      + 'Wrong response from the webhook = 后端返回了非 2xx，请直接 curl 一下 /tg-webhook 看状态码。');
+    const errMsg = String(wi.lastErrorMessage);
+    // TLS 类失败必须单独讲清楚：它和 403/secret 完全是两回事，且根因在「域名证书」，
+    // 改后端代码或换 secret 都毫无帮助。归到通用的 last_error 会把人带偏，所以单列一类。
+    if (/ssl|tls|certificate|handshake/i.test(errMsg)) {
+      let errHost = '';
+      try { errHost = new URL(wi.registeredUrl || out.webhookUrl || '').host; } catch (err) { errHost = ''; }
+      push('fatal', 'ssl_verify_failed',
+        'Telegram 能连到你的域名，但 TLS 证书校验没通过：' + errMsg
+        + (wi.lastErrorDate ? '（' + new Date(wi.lastErrorDate * 1000).toISOString() + '）' : '')
+        + '。OpenSSL 的 certificate verify failed（0A000086）几乎总是这三种之一：'
+        + '① 证书已过期；② 证书链不完整（服务端没下发中间证书）；③ 用了自签名或私有 CA 证书。'
+        + (errHost
+          ? '自查：openssl s_client -connect ' + errHost + ':443 -servername ' + errHost
+            + '，看「Verify return code」是否为 0、以及 notAfter 是否已经过去。'
+          : '')
+        + '注意：若你用的是 EdgeOne 默认共享域名（*.pages-scf-*.qcloudteo.com），'
+        + '证书由平台签发，过期或不受信时你无法自行更换 —— 请绑定自定义域名并申请免费 SSL 证书，'
+        + '然后设置 TG_PUBLIC_BASE_URL=https://<你的域名> 并重跑 action=set。'
+        + '（这个失败与 TG_WEBHOOK_SECRET 无关，改 secret 不会有帮助。）');
+    } else {
+      push('fatal', 'last_error',
+        'Telegram 最近一次投递失败：' + errMsg
+        + (wi.lastErrorDate ? '（' + new Date(wi.lastErrorDate * 1000).toISOString() + '）' : '')
+        + '。常见含义：403 Forbidden = 你设了 secret_token 但后端校验不通过（或没设却校验了）；'
+        + 'Wrong response from the webhook = 后端返回了非 2xx，请直接 curl 一下 /tg-webhook 看状态码。');
+    }
   }
   if (wi.lastSynchronizationErrorDate) {
     push('fatal', 'sync_error', 'Telegram 连不上你的 webhook 地址（同步失败）。请确认域名已生效、路径是 /tg-webhook、且没有被访问控制挡住。');

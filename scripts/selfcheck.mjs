@@ -1372,6 +1372,59 @@ async function main() {
     }
   });
 
+  await checkAsync('投递失败是 TLS/证书类错误时给 ssl_verify_failed，而不是误导性的 last_error', async () => {
+    stubTelegramFetch({
+      info: {
+        ok: true,
+        result: {
+          url: 'https://example.com/tg-webhook',
+          pending_update_count: 1,
+          last_error_date: 1792108708,
+          last_error_message: 'SSL error {error:0A000086:SSL routines::certificate verify failed}',
+        },
+      },
+    });
+    try {
+      const res = await tgSetupCall('?key=k', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN });
+      const j = await res.json();
+      const codes = j.hints.map(h => h.code);
+      assert.ok(codes.includes('ssl_verify_failed'), 'TLS 失败应单独归类');
+      assert.ok(!codes.includes('last_error'), '不应退化成通用的 last_error');
+      const h = j.hints.find(x => x.code === 'ssl_verify_failed');
+      assert.equal(h.level, 'fatal');
+      assert.match(h.message, /证书已过期/, '应点名最常见的过期原因');
+      assert.match(h.message, /example\.com/, '应带上出错主机名，方便自查');
+      assert.match(h.message, /openssl s_client/, '应给出可直接执行的自查命令');
+      assert.match(h.message, /与 TG_WEBHOOK_SECRET 无关/, '应主动排除 secret 这个常见误判方向');
+      assert.equal(j.healthy, false, '有投递错误时不应报健康');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('非 TLS 的投递失败仍走通用 last_error（回归保护：别把 403 误判成证书问题）', async () => {
+    stubTelegramFetch({
+      info: {
+        ok: true,
+        result: {
+          url: 'https://example.com/tg-webhook',
+          pending_update_count: 2,
+          last_error_date: 1700000000,
+          last_error_message: 'Wrong response from the webhook: 500 Internal Server Error',
+        },
+      },
+    });
+    try {
+      const res = await tgSetupCall('?key=k', { STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN });
+      const j = await res.json();
+      const codes = j.hints.map(h => h.code);
+      assert.ok(codes.includes('last_error'));
+      assert.ok(!codes.includes('ssl_verify_failed'), '非 TLS 错误不该被误判为证书问题');
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await checkAsync('注册地址与预期不一致时报 url_mismatch（Telegram 的请求根本没打到这里）', async () => {
     stubTelegramFetch({ info: { ok: true, result: { url: 'https://old-domain.example/tg-webhook', pending_update_count: 0 } } });
     try {
@@ -1399,6 +1452,87 @@ async function main() {
       assert.equal(j.base, 'https://chat.my.domain', '尾部斜杠应被归一化');
       assert.equal(j.usingCustomBase, true);
       assert.equal(j.webhook.urlMatches, true, '用了自定义域名就不该误报不一致');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // ---------- EdgeOne 的协议陷阱：函数看到的 request.url 恒为 http ----------
+  // 平台在边缘终止 TLS，再以明文 http 内部转发给函数。若直接拿 url.origin 当 webhook
+  // 地址，Telegram 会以 400（HTTPS url must be provided）拒绝 —— 下面四条守住这个回归。
+
+  function tgSetupCallAt(rawUrl, headers, env) {
+    return mod.handle({
+      request: new Request(rawUrl, { headers: headers || {} }),
+      env: env,
+      waitUntil: () => {},
+    });
+  }
+
+  await checkAsync('EdgeOne 场景：请求协议是 http 时，webhook 地址自动升级为 https（否则 Telegram 必然拒绝）', async () => {
+    const calls = stubTelegramFetch({});
+    try {
+      const res = await tgSetupCallAt('http://pages-x.pages-scf-sg-pro.qcloudteo.com/tg-setup?key=k&action=set', null, {
+        STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN,
+      });
+      const j = await res.json();
+      assert.equal(j.origin, 'http://pages-x.pages-scf-sg-pro.qcloudteo.com', '函数看到的协议确实会是 http');
+      assert.equal(j.base, 'https://pages-x.pages-scf-sg-pro.qcloudteo.com', '推导结果应升级为 https');
+      assert.equal(j.webhookUrlIsHttps, true);
+      assert.equal(j.baseSource, 'derived:upgraded-http-to-https', '应标注地址来自自动升级');
+      const sent = JSON.parse(calls.find(c => c.method === 'setWebhook').init.body);
+      assert.ok(sent.url.indexOf('https://') === 0, 'setWebhook 必须收到 https 地址，否则一定被 400 拒绝');
+      assert.ok(j.hints.some(h => h.code === 'base_auto_upgraded'), '应明确提示「已自动升级」，不静默');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('反代头 X-Forwarded-Proto: https 时按访客真实协议推导（并标注来源）', async () => {
+    stubTelegramFetch({});
+    try {
+      const res = await tgSetupCallAt('http://internal.example.com/tg-setup?key=k', {
+        'X-Forwarded-Proto': 'https',
+        'X-Forwarded-Host': 'chat.example.com',
+      }, {
+        STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN,
+      });
+      const j = await res.json();
+      assert.equal(j.base, 'https://chat.example.com', '应优先采信反代头而不是内部协议');
+      assert.equal(j.baseSource, 'derived:forwarded-proto');
+      assert.equal(j.origin, 'http://internal.example.com', 'origin 仍如实回显，便于对照');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('显式把 TG_PUBLIC_BASE_URL 配成 http 时给出 fatal 提示（不静默接受）', async () => {
+    stubTelegramFetch({});
+    try {
+      const res = await tgSetupCall('?key=k', {
+        STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN,
+        TG_PUBLIC_BASE_URL: 'http://chat.example.com',
+      });
+      const j = await res.json();
+      assert.equal(j.baseSource, 'env:TG_PUBLIC_BASE_URL', '显式配置优先，不被自动改写');
+      assert.equal(j.webhookUrlIsHttps, false);
+      assert.equal(j.healthy, false, '不是 https 时不应报健康');
+      assert.ok(j.hints.some(h => h.code === 'webhook_not_https' && h.level === 'fatal'));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('本地调试地址（localhost）不做 https 升级，但仍提示不是 https', async () => {
+    stubTelegramFetch({});
+    try {
+      const res = await tgSetupCallAt('http://localhost:8788/tg-setup?key=k', null, {
+        STORAGE_BACKEND: 'none', TG_SETUP_KEY: 'k', TG_BOT_TOKEN: FAKE_TOKEN,
+      });
+      const j = await res.json();
+      assert.equal(j.base, 'http://localhost:8788', '本地地址应保持原样，避免误伤本地调试');
+      assert.equal(j.baseSource, 'derived:request-url');
+      assert.ok(j.hints.some(h => h.code === 'webhook_not_https'), '本地 http 仍应如实提示');
     } finally {
       restoreFetch();
     }
