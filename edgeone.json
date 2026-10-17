@@ -3,7 +3,9 @@
   "installCommand": "npm install",
   "nodeVersion": "20.18.0",
   "cloudFunctions": {
-    "maxDuration": 120
+    "nodejs": {
+      "maxDuration": 120
+    }
   },
   "headers": [
     {
