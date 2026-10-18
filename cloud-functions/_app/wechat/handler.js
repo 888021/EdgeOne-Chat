@@ -1326,7 +1326,7 @@ async function triggerNextSelfRelay(env, origin, hop) {
     setTimeout(() => {
       if (!activePollInIsolate) {
         runWechatPollCycle(env, {
-          maxRuntimeMs: 35000,
+          maxRuntimeMs: 90000,
           longPollTimeoutMs: 22000,
           maxRounds: 4,
           singleShot: false,
