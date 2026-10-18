@@ -2105,6 +2105,130 @@ async function main() {
     diag.tgReset();
   });
 
+
+  console.log('\n=== 14. 微信 ClawBot (iLink) 通道与四重防盗绑自检 ===');
+  const wxIlink = await import('../cloud-functions/_app/wechat/ilink.js');
+  const wxHandler = await import('../cloud-functions/_app/wechat/handler.js');
+
+  await checkAsync('buildClientVersion 编码 2.4.10 为 132106 (0x0002040a)', () => {
+    assert.equal(wxIlink.buildClientVersion('2.4.10'), 132106);
+    assert.ok(wxIlink.randomWechatUin().length > 0);
+  });
+
+  await checkAsync('入站消息解析：支持纯文本、语音转写与引用上下文', () => {
+    const p1 = wxIlink.extractWechatMessageContent({
+      msg_id: 'm1',
+      from_user_id: 'wxid_1@im.wechat',
+      message_type: 1,
+      context_token: 'ctx_1',
+      item_list: [{ type: 1, text_item: { text: '你好 EdgeOne' } }],
+    });
+    assert.equal(p1.isUserMsg, true);
+    assert.equal(p1.fromUserId, 'wxid_1@im.wechat');
+    assert.equal(p1.text, '你好 EdgeOne');
+
+    const p2 = wxIlink.extractWechatMessageContent({
+      from_user_id: 'wxid_1@im.wechat',
+      message_type: 1,
+      context_token: 'ctx_2',
+      item_list: [{ type: 3, voice_item: { text: '语音转写测试' } }],
+    });
+    assert.equal(p2.text, '语音转写测试');
+  });
+
+  await checkAsync('四重防盗绑 1：未配置 WX_ADMIN_SECRET 或 ACCESS_PASSWORD 时，/api/wx/qrcode 强制返回 403 拒绝', async () => {
+    const res = await mod.handle({
+      request: new Request('https://example.com/api/wx/qrcode', { method: 'POST' }),
+      env: { STORAGE_BACKEND: 'none' },
+      waitUntil: () => {},
+    });
+    assert.equal(res.status, 403);
+    const j = await res.json();
+    assert.equal(j.code, 'NO_SECRET_CONFIGURED');
+  });
+
+  await checkAsync('四重防盗绑 2：配置 WX_ADMIN_SECRET 后，未带密钥时隐藏详情并拒绝二维码请求，带密钥时解锁', async () => {
+    const env = { STORAGE_BACKEND: 'none', WX_ADMIN_SECRET: 'eo-admin-999' };
+    const rPub = await mod.handle({
+      request: new Request('https://example.com/api/wx/status'),
+      env, waitUntil: () => {},
+    });
+    const jPub = await rPub.json();
+    assert.equal(jPub.adminAuthorized, false);
+    assert.equal(jPub.botId, undefined);
+
+    const rUnauth = await mod.handle({
+      request: new Request('https://example.com/api/wx/qrcode', { method: 'POST' }),
+      env, waitUntil: () => {},
+    });
+    assert.equal(rUnauth.status, 401);
+
+    const rAdm = await mod.handle({
+      request: new Request('https://example.com/api/wx/status', {
+        headers: { 'X-Wx-Admin-Token': 'eo-admin-999' },
+      }),
+      env, waitUntil: () => {},
+    });
+    const jAdm = await rAdm.json();
+    assert.equal(jAdm.adminAuthorized, true);
+  });
+
+  await checkAsync('四重防盗绑 3 & 4：已绑定后自动加锁防覆盖，且自动锁定绑定人 ilink_user_id', async () => {
+    const store = blobBackend.makeBlobBackend(fakeBlobStore());
+    const env = { R2: store, WX_ADMIN_SECRET: 'eo-admin-999' };
+    await wxHandler.saveWxCredentials(env, {
+      bot_token: 'bot_123:token_abc',
+      ilink_bot_id: 'bot_123@im.bot',
+      ilink_user_id: 'owner_wxid@im.wechat',
+      baseurl: 'https://ilinkai.weixin.qq.com',
+      expired: false,
+    });
+    const rQr = await wxHandler.handleWxApi(
+      new Request('https://example.com/api/wx/qrcode', {
+        method: 'POST',
+        headers: { 'X-Wx-Admin-Token': 'eo-admin-999' },
+      }),
+      env,
+      new URL('https://example.com/api/wx/qrcode')
+    );
+    assert.equal(rQr.status, 409);
+    const jQr = await rQr.json();
+    assert.equal(jQr.code, 'ALREADY_BOUND');
+
+    // 非绑定人发来的消息应被自动归属锁拦截（not_bound_owner）
+    const creds = await wxHandler.getWxCredentials(env);
+    const strangerRes = await wxHandler.processWechatMessage(env, creds, {
+      from_user_id: 'stranger_wxid@im.wechat',
+      message_type: 1,
+      context_token: 'ctx_x',
+      item_list: [{ type: 1, text_item: { text: '你好' } }],
+    });
+    assert.equal(strangerRes.skipped, true);
+    assert.equal(strangerRes.reason, 'not_bound_owner');
+  });
+
+  await checkAsync('微信专属排版清洗、中英双语口令解析与 MD5/AES-128-ECB 加解密自检', async () => {
+    const formatted = wxIlink.formatWechatText('## 标题测试\n**粗体文字**与`行内代码`\n- 列表项1\n[链接](https://example.com)');
+    assert.match(formatted, /▎标题测试/);
+    assert.ok(!formatted.includes('**'), '不应残留 ** 符号');
+    assert.match(formatted, /「行内代码」/);
+    assert.match(formatted, /• 列表项1/);
+
+    assert.deepEqual(wxHandler.parseWxCommand('菜单'), { cmd: '/help', rest: '' });
+    assert.deepEqual(wxHandler.parseWxCommand('模型 2'), { cmd: '/model', rest: '2' });
+    assert.deepEqual(wxHandler.parseWxCommand('画 一只穿宇航服的猫'), { cmd: '/draw', rest: '一只穿宇航服的猫' });
+    assert.deepEqual(wxHandler.parseWxCommand('清空'), { cmd: '/clear', rest: '' });
+    assert.deepEqual(wxHandler.parseWxCommand('状态'), { cmd: '/status', rest: '' });
+    assert.deepEqual(wxHandler.parseWxCommand('忘掉 测试关键词'), { cmd: '/forget', rest: '测试关键词' });
+
+    const sampleBytes = new TextEncoder().encode('Hello WeChat ClawBot Image Crypto!');
+    const sampleKey = new Uint8Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);
+    const enc = wxIlink.encryptAes128Ecb(sampleBytes, sampleKey);
+    const dec = await wxIlink.decryptAes128Ecb(enc, sampleKey);
+    assert.deepEqual(Array.from(dec), Array.from(sampleBytes));
+    assert.equal(wxIlink.md5Hex(new TextEncoder().encode('abc')), '900150983cd24fb0d6963f7d28e17f72');
+  });
+
   console.log('\n=== 结果 ===');
   console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
   if (fail > 0) process.exit(1);
