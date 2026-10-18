@@ -170,7 +170,14 @@ async function ilinkNotifyStop(baseUrl, token, channelVersion, timeoutMs) {
 }
 
 // 4. 长轮询获取新消息（getupdates）
+// 注意：腾讯 iLink 服务端对 getupdates 固定 Hold 35 秒（longpolling_timeout_ms: 35000），
+// 客户端超时必须 >= 38~40 秒（严禁设为 16s/22s/25s），否则客户端提前 Abort 会在腾讯服务端留下
+// 35 秒未释放的“僵尸连接”，导致期间发来的微信消息掉进僵尸连接并苦等约 65 秒才重投！
+const ILINK_SERVER_HOLD_MS = 35000;
+const ILINK_DEFAULT_POLL_TIMEOUT_MS = 40000;
+
 async function ilinkGetUpdates(baseUrl, token, getUpdatesBuf, channelVersion, timeoutMs) {
+  const effectiveTimeout = Math.max(parseInt(timeoutMs, 10) || ILINK_DEFAULT_POLL_TIMEOUT_MS, 38000);
   try {
     const data = await ilinkPost(
       baseUrl,
@@ -178,9 +185,9 @@ async function ilinkGetUpdates(baseUrl, token, getUpdatesBuf, channelVersion, ti
       { get_updates_buf: String(getUpdatesBuf || '') },
       token,
       channelVersion,
-      timeoutMs || 25000
+      effectiveTimeout
     );
-    return data || { ret: 0, msgs: [], get_updates_buf: getUpdatesBuf || '' };
+    return data || { ret: 0, msgs: [], get_updates_buf: getUpdatesBuf || '', longpolling_timeout_ms: ILINK_SERVER_HOLD_MS };
   } catch (e) {
     const nm = (e && e.name) ? String(e.name) : '';
     const msg = String((e && e.message) || '');
@@ -705,6 +712,272 @@ async function ilinkUploadAndSendImage(baseUrl, cdnBaseUrl, token, toUserId, con
   return await ilinkPost(baseUrl, 'ilink/bot/sendmessage', sendBody, token, channelVersion, timeoutMs || 15000);
 }
 
+
+// ================= 11. 多格式文档正文提取器（支持 Word .docx / Excel .xlsx / PPT .pptx / PDF / Markdown / CSV / JSON / 代码，自动识别 UTF-8 与 GB18030） =================
+const SUPPORTED_KB_FILE_EXT_RE = /\.(docx|xlsx|pptx|pdf|md|markdown|txt|csv|tsv|json|jsonl|log|rtf|py|js|mjs|cjs|ts|tsx|jsx|vue|svelte|html|htm|css|scss|less|xml|yaml|yml|toml|ini|conf| env|sh|bash|zsh|sql|go|rs|java|kt|swift|c|cpp|h|hpp|cs|php|rb|lua|r|dart)$/i;
+
+function decodeTextSmart(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || 0);
+  if (!u8.byteLength) return '';
+  // UTF-8 BOM
+  if (u8.byteLength >= 3 && u8[0] === 0xef && u8[1] === 0xbb && u8[2] === 0xbf) {
+    return new TextDecoder('utf-8').decode(u8.subarray(3));
+  }
+  // UTF-16LE BOM
+  if (u8.byteLength >= 2 && u8[0] === 0xff && u8[1] === 0xfe) {
+    return new TextDecoder('utf-16le').decode(u8.subarray(2));
+  }
+  // UTF-16BE BOM
+  if (u8.byteLength >= 2 && u8[0] === 0xfe && u8[1] === 0xff) {
+    return new TextDecoder('utf-16be').decode(u8.subarray(2));
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(u8);
+  } catch (e) {
+    try {
+      return new TextDecoder('gb18030').decode(u8);
+    } catch (e2) {
+      return new TextDecoder('utf-8').decode(u8);
+    }
+  }
+}
+
+function decodeXmlEntities(s) {
+  return String(s || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10) || 32))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16) || 32));
+}
+
+async function inflateRawBytes(compData, format = 'raw') {
+  if (typeof DecompressionStream === 'undefined') return null;
+  if (format === 'zlib') {
+    try {
+      const ds = new DecompressionStream('deflate');
+      const w = ds.writable.getWriter();
+      w.write(compData).catch(() => {});
+      w.close().catch(() => {});
+      const reader = ds.readable.getReader();
+      const chunks = [];
+      let total = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) { chunks.push(value); total += value.byteLength; }
+        }
+      } catch (err) {}
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+      return out;
+    } catch (e) {
+      return null;
+    }
+  }
+  try {
+    const ds = new DecompressionStream('deflate-raw');
+    const w = ds.writable.getWriter();
+    w.write(compData).catch(() => {});
+    w.close().catch(() => {});
+    return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+  } catch (e) {
+    // 兼容仅支持 'deflate' (zlib 封装) 的 Node 18 等运行时：前置 0x78 0x9c 头部读取解压流
+    const wrapped = new Uint8Array(compData.byteLength + 2);
+    wrapped[0] = 0x78;
+    wrapped[1] = 0x9c;
+    wrapped.set(compData, 2);
+    return await inflateRawBytes(wrapped, 'zlib');
+  }
+}
+
+async function extractZipXmlEntries(zipBytes, targetPattern) {
+  const bytes = zipBytes instanceof Uint8Array ? zipBytes : new Uint8Array(zipBytes || 0);
+  if (bytes.byteLength < 22) throw new Error('文件体积过小，不是合法的 Office/ZIP 文档');
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let eocdPos = -1;
+  const minPos = Math.max(0, bytes.byteLength - 65557);
+  for (let i = bytes.byteLength - 22; i >= minPos; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) {
+      eocdPos = i;
+      break;
+    }
+  }
+  if (eocdPos < 0) throw new Error('未找到 ZIP 目录签名，请确认文件是 .docx/.xlsx/.pptx 格式（老版二进制 .doc/.xls 请另存为 .docx/.xlsx）');
+  const totalEntries = dv.getUint16(eocdPos + 10, true);
+  const cdOffset = dv.getUint32(eocdPos + 16, true);
+  let pos = cdOffset;
+  const results = [];
+  const dec = new TextDecoder('utf-8');
+
+  for (let idx = 0; idx < totalEntries && pos + 46 <= bytes.byteLength; idx++) {
+    if (dv.getUint32(pos, true) !== 0x02014b50) break;
+    const method = dv.getUint16(pos + 10, true);
+    const compSize = dv.getUint32(pos + 20, true);
+    const fnLen = dv.getUint16(pos + 28, true);
+    const extraLen = dv.getUint16(pos + 30, true);
+    const commentLen = dv.getUint16(pos + 32, true);
+    const localHdrOffset = dv.getUint32(pos + 42, true);
+    const name = dec.decode(bytes.subarray(pos + 46, pos + 46 + fnLen));
+    pos += 46 + fnLen + extraLen + commentLen;
+
+    if (!targetPattern.test(name)) continue;
+    if (localHdrOffset + 30 > bytes.byteLength) continue;
+    const lFnLen = dv.getUint16(localHdrOffset + 26, true);
+    const lExtraLen = dv.getUint16(localHdrOffset + 28, true);
+    const dataStart = localHdrOffset + 30 + lFnLen + lExtraLen;
+    if (dataStart + compSize > bytes.byteLength) continue;
+    const compData = bytes.subarray(dataStart, dataStart + compSize);
+
+    let rawBytes = null;
+    if (method === 0) rawBytes = compData;
+    else if (method === 8) rawBytes = await inflateRawBytes(compData, 'raw');
+    if (rawBytes && rawBytes.byteLength) {
+      results.push({ name, text: dec.decode(rawBytes) });
+    }
+  }
+  return results;
+}
+
+async function extractWechatDocumentText(fileName, rawBytes) {
+  const fname = String(fileName || 'document.txt').trim();
+  const extMatch = /\.([a-zA-Z0-9]+)$/.exec(fname);
+  const ext = extMatch ? extMatch[1].toLowerCase() : '';
+  const bytes = rawBytes instanceof Uint8Array ? rawBytes : new Uint8Array(rawBytes || 0);
+
+  // 1) Word (.docx)
+  if (ext === 'docx') {
+    const entries = await extractZipXmlEntries(bytes, /^word\/(document|header\d*|footer\d*)\.xml$/i);
+    if (!entries.length) throw new Error('无法从 .docx 中解析出 word/document.xml');
+    entries.sort((a, b) => (a.name.includes('document') ? -1 : 1));
+    const parts = [];
+    for (const e of entries) {
+      const cleaned = decodeXmlEntities(
+        e.text
+          .replace(/<w:tab\b[^>]*\/>/gi, '\t')
+          .replace(/<w:br\b[^>]*\/>/gi, '\n')
+          .replace(/<\/w:p>/gi, '\n')
+          .replace(/<\/w:tr>/gi, '\n')
+          .replace(/<\/w:tc>/gi, ' | ')
+          .replace(/<[^>]+>/g, '')
+      ).replace(/\n{3,}/g, '\n\n').trim();
+      if (cleaned) parts.push(cleaned);
+    }
+    return parts.join('\n\n').trim();
+  }
+
+  // 2) Excel (.xlsx)
+  if (ext === 'xlsx') {
+    const entries = await extractZipXmlEntries(bytes, /^xl\/(sharedStrings\.xml|worksheets\/sheet\d+\.xml)$/i);
+    if (!entries.length) throw new Error('无法从 .xlsx 中解析出工作表数据');
+    const sharedStrings = [];
+    const ssEntry = entries.find(e => /sharedStrings\.xml$/i.test(e.name));
+    if (ssEntry) {
+      const siMatches = ssEntry.text.match(/<si\b[^>]*>[\s\S]*?<\/si>/gi) || [];
+      for (const si of siMatches) {
+        const tParts = (si.match(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/gi) || []).map(t => decodeXmlEntities(t.replace(/<[^>]+>/g, '')));
+        sharedStrings.push(tParts.join(''));
+      }
+    }
+    const sheets = entries.filter(e => /worksheets\/sheet\d+\.xml$/i.test(e.name)).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    const sheetTexts = [];
+    sheets.forEach((sh, idx) => {
+      const rows = sh.text.match(/<row\b[^>]*>[\s\S]*?<\/row>/gi) || [];
+      const rowLines = [];
+      for (const rowXml of rows) {
+        const cells = rowXml.match(/<c\b[^>]*>[\s\S]*?<\/c>/gi) || [];
+        const cellVals = [];
+        for (const cXml of cells) {
+          const isShared = /\bt="s"/i.test(cXml);
+          const isInline = /\bt="inlineStr"/i.test(cXml);
+          if (isInline) {
+            const m = /<is\b[^>]*>([\s\S]*?)<\/is>/i.exec(cXml);
+            cellVals.push(m ? decodeXmlEntities(m[1].replace(/<[^>]+>/g, '')).trim() : '');
+          } else {
+            const m = /<v\b[^>]*>([\s\S]*?)<\/v>/i.exec(cXml);
+            const rawV = m ? m[1].trim() : '';
+            if (isShared && rawV !== '') {
+              const sIdx = parseInt(rawV, 10);
+              cellVals.push(sharedStrings[sIdx] !== undefined ? sharedStrings[sIdx] : rawV);
+            } else {
+              cellVals.push(decodeXmlEntities(rawV));
+            }
+          }
+        }
+        if (cellVals.some(v => v !== '')) rowLines.push(cellVals.join(' | '));
+      }
+      if (rowLines.length) sheetTexts.push(`### 工作表 ${idx + 1}\n` + rowLines.join('\n'));
+    });
+    return sheetTexts.join('\n\n').trim();
+  }
+
+  // 3) PowerPoint (.pptx)
+  if (ext === 'pptx') {
+    const entries = await extractZipXmlEntries(bytes, /^ppt\/slides\/slide\d+\.xml$/i);
+    if (!entries.length) throw new Error('无法从 .pptx 中解析出幻灯片内容');
+    entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    const slides = [];
+    entries.forEach((sl, idx) => {
+      const txt = decodeXmlEntities(
+        sl.text
+          .replace(/<\/a:p>/gi, '\n')
+          .replace(/<[^>]+>/g, '')
+      ).replace(/\n{3,}/g, '\n\n').trim();
+      if (txt) slides.push(`### 幻灯片第 ${idx + 1} 页\n${txt}`);
+    });
+    return slides.join('\n\n').trim();
+  }
+
+  // 4) PDF (.pdf) 轻量级文本流提取
+  if (ext === 'pdf') {
+    const latin = new TextDecoder('latin1').decode(bytes);
+    const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+    const extractedChunks = [];
+    let m;
+    let count = 0;
+    while ((m = streamRegex.exec(latin)) !== null && count < 120) {
+      count++;
+      const rawStr = m[1];
+      const chunkBytes = new Uint8Array(rawStr.length);
+      for (let i = 0; i < rawStr.length; i++) chunkBytes[i] = rawStr.charCodeAt(i) & 0xff;
+      let decodedStream = '';
+      const inflated = await inflateRawBytes(chunkBytes, 'zlib');
+      if (inflated && inflated.byteLength) {
+        decodedStream = decodeTextSmart(inflated);
+      } else {
+        decodedStream = rawStr;
+      }
+      const tjMatches = decodedStream.match(/\(([^()\\]|\\.)*\)\s*Tj|\[([^\]]*)\]\s*TJ/g) || [];
+      for (const tj of tjMatches) {
+        const lits = tj.match(/\(([^()\\]|\\.)*\)/g) || [];
+        const line = lits.map(l => l.slice(1, -1).replace(/\\([nrtbf()\\])/g, '$1')).join('');
+        if (line.trim()) extractedChunks.push(line.trim());
+      }
+    }
+    const joined = extractedChunks.join('\n').trim();
+    if (joined.length >= 20) return joined;
+    throw new Error('该 PDF 为扫描件或使用了自定义字库编码，建议转为 .docx / .md / .txt 或直接截图发给我识图');
+  }
+
+  // 5) HTML / XML / 文本 / Markdown / CSV / JSON / 代码
+  let text = decodeTextSmart(bytes);
+  if (ext === 'html' || ext === 'htm') {
+    text = decodeXmlEntities(
+      text
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<\/(p|div|h[1-6]|li|tr|section|article|header|footer)>/gi, '\n')
+        .replace(/<br\b[^>]*\/>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+    ).replace(/\n{3,}/g, '\n\n').trim();
+  }
+  return text.trim();
+}
+
 // 解析入站 iLink 消息体：提取文本、语音转写、引用上下文及图片/文件媒体描述
 function extractWechatMessageContent(msg) {
   if (!msg || typeof msg !== 'object') {
@@ -824,5 +1097,8 @@ export {
   decryptAes128Ecb,
   ilinkDownloadMediaBytes,
   ilinkUploadAndSendImage,
+  SUPPORTED_KB_FILE_EXT_RE,
+  decodeTextSmart,
+  extractWechatDocumentText,
   extractWechatMessageContent,
 };

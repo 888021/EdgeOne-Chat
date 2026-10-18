@@ -2229,6 +2229,85 @@ async function main() {
     assert.equal(wxIlink.md5Hex(new TextEncoder().encode('abc')), '900150983cd24fb0d6963f7d28e17f72');
   });
 
+  await checkAsync('微信 35s 长轮询对齐与后台自接力链：不产生半途掐断僵尸连接，且收到消息立即释放锁并交棒下一跳', async () => {
+    const store = blobBackend.makeBlobBackend(fakeBlobStore());
+    const env = {
+      R2: store,
+      WX_ADMIN_SECRET: 'eo-admin-999',
+      API_URL_1: 'https://api.example.com/v1/chat/completions',
+      API_KEY_1: 'sk-test-123',
+      MODEL_1: 'gpt-test:测试模型',
+    };
+    await wxHandler.saveWxCredentials(env, {
+      bot_token: 'bot_relay:token_xyz',
+      ilink_bot_id: 'bot_relay@im.bot',
+      ilink_user_id: 'owner_wx@im.wechat',
+      baseurl: 'https://ilinkai.weixin.qq.com',
+      relay_origin: 'https://my-bot.edgeone.app',
+      expired: false,
+    });
+
+    let relayDispatchedDuringAi = false;
+    let lockHeldDuringAi = true;
+    let relayHopReceived = 0;
+
+    globalThis.fetch = async (url, init) => {
+      const u = String(url);
+      if (u.includes('/ilink/bot/getupdates')) {
+        return new Response(JSON.stringify({
+          ret: 0,
+          msgs: [{
+            msg_id: 'msg_fast_1',
+            from_user_id: 'owner_wx@im.wechat',
+            message_type: 1,
+            context_token: 'ctx_fast_1',
+            item_list: [{ type: 1, text_item: { text: '测试65秒修复' } }],
+          }],
+          get_updates_buf: 'cursor_after_1',
+          longpolling_timeout_ms: 35000,
+        }), { status: 200 });
+      }
+      if (u.includes('/wx-webhook?relay=1')) {
+        const mHop = /hop=(\d+)/.exec(u);
+        if (mHop) relayHopReceived = parseInt(mHop[1], 10);
+        return new Response(JSON.stringify({ ok: true, relayed: true }), { status: 200 });
+      }
+      if (u.includes('api.example.com/v1/chat/completions')) {
+        // 当 AI 正在思考时，验证轮询锁已被提前释放，且下一棒自接力请求已经发出！
+        const lockObj = await store.get('wx_poll_lock');
+        lockHeldDuringAi = !!lockObj;
+        relayDispatchedDuringAi = relayHopReceived > 0;
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: '秒回成功！' } }],
+        }), { status: 200 });
+      }
+      if (u.includes('/ilink/bot/sendmessage') || u.includes('/ilink/bot/getconfig') || u.includes('/ilink/bot/sendtyping')) {
+        return new Response(JSON.stringify({ ret: 0, typing_ticket: 'tk_1' }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    };
+
+    try {
+      const res = await wxHandler.runWechatPollCycle(env, {
+        maxRuntimeMs: 44000,
+        longPollTimeoutMs: 40000,
+        maxRounds: 2,
+        singleShot: false,
+        autoRelay: true,
+        origin: 'https://my-bot.edgeone.app',
+        relayHop: 5,
+      });
+      assert.equal(res.ok, true);
+      assert.equal(res.received, 1);
+      assert.equal(res.processed, 1);
+      assert.equal(lockHeldDuringAi, false, '进入 AI 推理前必须已释放轮询锁，供下一棒立即监听');
+      assert.equal(relayDispatchedDuringAi, true, '进入 AI 推理前必须已触发下一棒自接力请求');
+      assert.equal(relayHopReceived, 6, '下一棒 hop 应递增为 6');
+    } finally {
+      restoreFetch();
+    }
+  });
+
   console.log('\n=== 结果 ===');
   console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
   if (fail > 0) process.exit(1);

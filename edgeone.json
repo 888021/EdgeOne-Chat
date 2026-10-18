@@ -5,11 +5,6 @@
   "cloudFunctions": {
     "maxDuration": 120
   },
-  "triggers": {
-    "crons": [
-      "*/1 * * * *"
-    ]
-  },
   "headers": [
     {
       "source": "/sw.js",
