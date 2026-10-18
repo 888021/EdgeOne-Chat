@@ -40,6 +40,7 @@ import {
   ilinkSendTyping,
   ilinkSendMessage,
   formatWechatText,
+  md5Hex,
   ilinkDownloadMediaBytes,
   ilinkUploadAndSendImage,
   extractWechatMessageContent,
@@ -73,6 +74,33 @@ const wxQrRedirectNodes = new Map();
 
 const seenWxMsgIds = new Map();
 let activePollInIsolate = false;
+let lastDaemonWakeCheckAt = 0;
+let lastKnownPublicOrigin = '';
+
+function isRealPublicOrigin(origin) {
+  if (!origin || typeof origin !== 'string') return false;
+  if (!/^https?:\/\//i.test(origin)) return false;
+  if (/example\.com|localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(origin)) return false;
+  return true;
+}
+
+function rememberPublicOrigin(urlOrOrigin) {
+  try {
+    const o = typeof urlOrOrigin === 'string' && urlOrOrigin.startsWith('http')
+      ? new URL(urlOrOrigin).origin
+      : (urlOrOrigin && urlOrOrigin.origin ? urlOrOrigin.origin : '');
+    if (isRealPublicOrigin(o)) lastKnownPublicOrigin = o;
+    return lastKnownPublicOrigin;
+  } catch (e) {
+    return lastKnownPublicOrigin;
+  }
+}
+
+function computeWxRelayToken(botToken) {
+  const t = String(botToken || '').trim();
+  if (!t) return '';
+  return md5Hex(new TextEncoder().encode('wx_self_relay_v1_' + t));
+}
 
 // 实时诊断状态（内存 + 存储双写）
 const wxDiagMem = {
@@ -254,6 +282,7 @@ async function getWxCredentials(env, forceRefresh) {
             expired: !!parsed.expired,
             errmsg: parsed.errmsg || '',
             updated_at: parsed.updated_at || '',
+            relay_origin: String(parsed.relay_origin || ''),
             source: 'r2',
           };
           cachedWxCredsExp = Date.now() + 30 * 1000;
@@ -276,6 +305,7 @@ async function saveWxCredentials(env, creds) {
     expired: !!creds.expired,
     errmsg: String(creds.errmsg || ''),
     updated_at: creds.updated_at || new Date().toISOString(),
+    relay_origin: String(creds.relay_origin || lastKnownPublicOrigin || ''),
     source: 'r2',
   };
   cachedWxCreds = clean;
@@ -1284,10 +1314,96 @@ async function runWechatPollCycle(env, opts) {
   }
 }
 
+// 服务端全自动自接力常驻引擎（无需外部监控、无需保持网页打开，扫码后像 Telegram 一样自动在后台收发消息）
+async function triggerNextSelfRelay(env, origin, hop) {
+  try {
+    const creds = await getWxCredentials(env);
+    if (!creds || !creds.bot_token || creds.expired) return;
+    const effOrigin = isRealPublicOrigin(origin) ? origin : (isRealPublicOrigin(creds.relay_origin) ? creds.relay_origin : lastKnownPublicOrigin);
+    const nextHop = ((parseInt(hop, 10) || 0) + 1) % 10000;
+
+    // 1) 若当前进程/容器仍存活（如 EdgeOne Node 实例常驻），150ms 后直接在进程内无缝续跑下一轮
+    setTimeout(() => {
+      if (!activePollInIsolate) {
+        runWechatPollCycle(env, {
+          maxRuntimeMs: 65000,
+          longPollTimeoutMs: 22000,
+          maxRounds: 4,
+          singleShot: false,
+          autoRelay: true,
+          origin: effOrigin,
+          relayHop: nextHop,
+        }).catch(() => {});
+      }
+    }, 150);
+
+    // 2) 同时通过公网自接力请求唤醒下一个 Serverless 生命周期实例（2.2s 触发即走，不阻塞当前实例退出）
+    if (isRealPublicOrigin(effOrigin)) {
+      const relayToken = computeWxRelayToken(creds.bot_token);
+      const relayUrl = `${effOrigin}/wx-webhook?relay=1&hop=${nextHop}`;
+      await fetch(relayUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wx-Relay-Token': relayToken,
+        },
+        body: JSON.stringify({ action: 'poll', relay: true, hop: nextHop }),
+        signal: AbortSignal.timeout(2200),
+      }).catch(() => {});
+    }
+  } catch (e) {}
+}
+
+function kickWxAutoDaemon(env, ctx, origin) {
+  const effOrigin = rememberPublicOrigin(origin);
+  const task = (async () => {
+    const res = await runWechatPollCycle(env, {
+      maxRuntimeMs: 65000,
+      longPollTimeoutMs: 22000,
+      maxRounds: 4,
+      singleShot: false,
+      autoRelay: true,
+      origin: effOrigin,
+      relayHop: 1,
+    });
+    if (res && res.ok && !res.locked && !res.expired) {
+      await triggerNextSelfRelay(env, effOrigin, 1);
+    }
+  })().catch(() => {});
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    try { ctx.waitUntil(task); } catch (e) {}
+  }
+  return task;
+}
+
+function maybeWakeWxDaemon(request, env, ctx) {
+  try {
+    const now = Date.now();
+    if (activePollInIsolate) return;
+    if (wxDiagMem.lastPollAt && now - wxDiagMem.lastPollAt < 22000) return;
+    if (now - lastDaemonWakeCheckAt < 10000) return;
+    lastDaemonWakeCheckAt = now;
+    const origin = request && request.url ? rememberPublicOrigin(request.url) : lastKnownPublicOrigin;
+    if (!isRealPublicOrigin(origin)) return;
+    const task = (async () => {
+      const creds = await getWxCredentials(env);
+      if (!creds || !creds.bot_token || creds.expired) return;
+      await kickWxAutoDaemon(env, ctx, origin);
+    })().catch(() => {});
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      try { ctx.waitUntil(task); } catch (e) {}
+    }
+  } catch (e) {}
+}
+
 // ================= 8. Webhook 接收器与全天候免开网页保活端点（GET/POST /wx-webhook） =================
-async function handleWxWebhook(request, env, url) {
+async function handleWxWebhook(request, env, url, ctx) {
   const reqUrl = url || new URL(request.url);
-  const auth = checkWxAdminAuth(env, request, reqUrl);
+  const origin = rememberPublicOrigin(reqUrl.origin);
+  const credsForRelay = await getWxCredentials(env);
+  const relayHeader = (request && request.headers && request.headers.get('X-Wx-Relay-Token')) || '';
+  const isValidRelay = !!(credsForRelay && credsForRelay.bot_token && relayHeader && safeEqual(relayHeader, computeWxRelayToken(credsForRelay.bot_token)));
+  const auth = isValidRelay ? { authorized: true, noSecretConfigured: false } : checkWxAdminAuth(env, request, reqUrl);
 
   // 如果配置了 WX_WEBHOOK_SECRET 或管理员口令，校验权限
   if (env.WX_WEBHOOK_SECRET) {
@@ -1321,6 +1437,29 @@ async function handleWxWebhook(request, env, url) {
 
     // 如果 POST 请求体为空或显式指定 action=poll，同样执行全窗口连续长轮询
     if (!payload || payload.action === 'poll' || (!payload.msgs && !payload.from_user_id && !payload.user_id && !payload.msg)) {
+      const isRelay = !!(payload && payload.relay) || reqUrl.searchParams.get('relay') === '1';
+      const hop = parseInt((payload && payload.hop) || reqUrl.searchParams.get('hop') || '1', 10) || 1;
+      if (isRelay) {
+        // 异步接力：立即响应上游实例使其干净释放，本实例在后台跑满周期后继续自接力下一棒
+        const bgTask = (async () => {
+          const r = await runWechatPollCycle(env, {
+            maxRuntimeMs: 65000,
+            longPollTimeoutMs: 22000,
+            maxRounds: 4,
+            singleShot: false,
+            autoRelay: true,
+            origin,
+            relayHop: hop,
+          });
+          if (r && r.ok && !r.locked && !r.expired) {
+            await triggerNextSelfRelay(env, origin, hop);
+          }
+        })().catch(() => {});
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          try { ctx.waitUntil(bgTask); } catch (e) {}
+        }
+        return new Response(JSON.stringify({ ok: true, relayed: true, hop }), { status: 200, headers: CORS_HEADERS });
+      }
       const timeoutMs = parseInt(payload.timeout_ms || reqUrl.searchParams.get('timeout_ms') || '50000', 10) || 50000;
       const res = await runWechatPollCycle(env, {
         maxRuntimeMs: Math.min(Math.max(timeoutMs, 5000), 85000),
@@ -1376,8 +1515,9 @@ function maskToken(token) {
   return s.slice(0, 6) + '…' + s.slice(-6);
 }
 
-async function handleWxApi(request, env, url) {
+async function handleWxApi(request, env, url, ctx) {
   const path = url.pathname;
+  const origin = rememberPublicOrigin(url.origin);
   const chanVer = wxChannelVersion(env);
   const defaultBase = normalizeBaseUrl((env && env.WX_BASE_URL) || DEFAULT_ILINK_BASE_URL);
   const auth = checkWxAdminAuth(env, request, url);
@@ -1555,9 +1695,12 @@ async function handleWxApi(request, env, url) {
         };
         const savedOk = await saveWxCredentials(env, newCreds);
         await saveWxCursor(env, newCreds.ilink_bot_id, '');
+        newCreds.relay_origin = origin;
+        await saveWxCredentials(env, newCreds);
         await ilinkNotifyStart(newCreds.baseurl, newCreds.bot_token, chanVer, 6000);
-        await wxRecordDiag(env, 'login', `扫码绑定成功 (${newCreds.ilink_user_id || newCreds.ilink_bot_id})`, newCreds.ilink_user_id, true);
+        await wxRecordDiag(env, 'login', `扫码绑定成功 (${newCreds.ilink_user_id || newCreds.ilink_bot_id})，后台自接力守护已启动`, newCreds.ilink_user_id, true);
         wxQrRedirectNodes.delete(qrcode);
+        kickWxAutoDaemon(env, ctx, origin);
         return new Response(JSON.stringify({
           ok: true,
           status: 'confirmed',
@@ -1693,6 +1836,8 @@ export {
   parseWxCommand,
   processWechatMessage,
   runWechatPollCycle,
+  kickWxAutoDaemon,
+  maybeWakeWxDaemon,
   handleWxWebhook,
   handleWxApi,
 };

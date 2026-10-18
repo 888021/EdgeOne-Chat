@@ -28,6 +28,7 @@ import {
   saveWxCredentials,
   clearWxCredentials,
   saveWxCursor,
+  kickWxAutoDaemon,
 } from '../wechat/handler.js';
 
 // 全局内存缓存（L1 缓存，带 60s TTL）
@@ -502,8 +503,11 @@ export async function handleTgWebhook(request, env) {
                       updated_at: new Date().toISOString(),
                     };
                     await saveWxCredentials(env, newCreds);
+                    newCreds.relay_origin = new URL(request.url).origin;
+                    await saveWxCredentials(env, newCreds);
                     await saveWxCursor(env, newCreds.ilink_bot_id, '');
                     await ilinkNotifyStart(newCreds.baseurl, newCreds.bot_token, chanVer, 6000);
+                    kickWxAutoDaemon(env, null, newCreds.relay_origin);
                     const okText = `🎉 微信 ClawBot 绑定成功并已自动加锁！\n• 机器人 ID：${newCreds.ilink_bot_id}\n• 唯一授权微信用户：${newCreds.ilink_user_id}\n现在可以直接在手机微信 ClawBot 中与我对话了。`;
                     if (statusMsgId) {
                       await tgApi('editMessageText', { chat_id: chatId, message_id: statusMsgId, text: okText }).catch(() => {});

@@ -18,7 +18,7 @@ import { readErrorBody } from './agent/stability.js';
 import { handleWebAgent } from './web-agent.js';
 import { handleTgWebhook } from './telegram/handler.js';
 import { handleTgSetup } from './telegram/setup.js';
-import { handleWxWebhook, handleWxApi } from './wechat/handler.js';
+import { handleWxWebhook, handleWxApi, maybeWakeWxDaemon } from './wechat/handler.js';
 import { ICON_B64, getIconBytes } from './pwa/icons.js';
 import { MANIFEST_JSON } from './pwa/manifest.js';
 import { SW_JS } from './pwa/service-worker.js';
@@ -102,8 +102,12 @@ async function routeRequest(request, env, ctx) {
     }
 
     // 微信 ClawBot (iLink) Web 管理与扫码绑定 / 长轮询触发接口（内部由 checkWxAdminAuth 强制防盗绑鉴权）
+    if (url.pathname !== '/wx-webhook') {
+      maybeWakeWxDaemon(request, env, ctx);
+    }
+
     if (url.pathname.startsWith('/api/wx/')) {
-      return await handleWxApi(request, env, url);
+      return await handleWxApi(request, env, url, ctx);
     }
 
     // 生图结果：转存后的图片通过这里回给浏览器。
@@ -204,7 +208,7 @@ async function routeRequest(request, env, ctx) {
 
     // 微信 ClawBot (iLink) Webhook：支持第三方 iLink 网关推送消息
     if ((request.method === 'POST' || request.method === 'GET') && url.pathname === '/wx-webhook') {
-      return await handleWxWebhook(request, env, url);
+      return await handleWxWebhook(request, env, url, ctx);
     }
 
     return new Response('Not Found', { status: 404 });

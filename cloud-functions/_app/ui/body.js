@@ -96,19 +96,9 @@ export default `</head>
         </div>
         <div class="settings-hint">注：首次扫码绑定后，请先在手机微信（我 → 设置 → 插件 → ClawBot）里给机器人发任意一句话（如「你好」）以激活对话令牌。</div>
       </div>
-      <div class="settings-field" style="margin-top:10px;padding:10px 12px;border-radius:10px;background:var(--bg-soft);border:1px solid var(--border);">
-        <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;cursor:pointer;">
-          <input type="checkbox" id="wxLivePollToggle" checked>
-          <span>🟢 网页打开期间后台自动守护收发微信消息（默认开启，收到新消息自动同步到网页侧栏）</span>
-        </label>
-        <div id="wxKeepaliveBox" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);font-size:12px;line-height:1.55;">
-          <div style="font-weight:600;margin-bottom:4px;">🌐 关掉网页也能 24 小时秒回（免开网页保活 URL）：</div>
-          <div style="display:flex;gap:6px;align-items:center;">
-            <input type="text" id="wxKeepaliveUrlInput" class="settings-input" style="flex:1;font-size:11px;padding:6px 8px;" readonly>
-            <button type="button" id="wxCopyKeepaliveBtn" class="btn" style="padding:6px 10px;font-size:12px;">复制</button>
-          </div>
-          <div class="settings-hint" style="margin-top:4px;">因微信 iLink 协议采用客户端长轮询拉取，将上方链接填入任意免费定时监控（如 UptimeRobot / 腾讯云监控 / Crontab 每 1 分钟 GET 一次），即可在完全关闭电脑网页后全天候 24 小时秒回！</div>
-        </div>
+      <div class="settings-field" style="margin-top:10px;padding:10px 12px;border-radius:10px;background:var(--bg-soft);border:1px solid var(--border);font-size:12px;line-height:1.6;">
+        <div style="font-weight:600;color:#10b981;">⚡ 全自动后台收发（像 Telegram 一样免配置外部监控）</div>
+        <div style="color:var(--text-sub);margin-top:2px;">扫码绑定成功后，服务端会自动启动「自接力常驻长轮询引擎」；即使直接关掉当前网页，机器人也会在云端自动接力收发微信消息，无需手动添加任何外部监控。</div>
       </div>
       <div class="settings-field" id="wxDiagSection" style="display:none;margin-top:10px;">
         <label class="settings-label">📋 实时收发与诊断日志</label>
