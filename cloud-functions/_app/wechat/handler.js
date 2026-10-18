@@ -183,7 +183,6 @@ function wxSafeId(id) {
   return String(id == null ? '' : id).replace(/[^a-zA-Z0-9_@.-]/g, '_').slice(0, 96);
 }
 
-// 为微信用户生成与 Telegram / Web 隔离的会话 ID（复用 tg-history / memory / mode / resume）
 function wxSessionChatId(userId) {
   return 'wx_' + String(userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 56);
 }
@@ -201,7 +200,7 @@ function uint8ToBase64(bytes) {
   return btoa(binary);
 }
 
-// ================= 0. 微信通道管理员鉴权（防路人盗绑核心防线） =================
+// ================= 0. 微信通道管理员鉴权 =================
 function checkWxAdminAuth(env, request, url) {
   const adminSecret = String((env && env.WX_ADMIN_SECRET) || '').trim();
   const accessPwd = String((env && env.ACCESS_PASSWORD) || '').trim();
@@ -212,7 +211,7 @@ function checkWxAdminAuth(env, request, url) {
     return {
       authorized: false,
       noSecretConfigured: true,
-      reason: '安全锁定：当前未配置 WX_ADMIN_SECRET 或 ACCESS_PASSWORD，为防止公开网址被他人恶意扫码绑定，已禁止网页端绑定操作。请在环境变量中设置 WX_ADMIN_SECRET（或使用 Telegram 机器人发送 /wxlogin 绑定）。',
+      reason: '安全锁定：当前未配置 WX_ADMIN_SECRET 或 ACCESS_PASSWORD，为防止公开网址被他人恶意扫码绑定，已禁止网页端绑定操作。请在环境变量中设置 WX_ADMIN_SECRET。',
     };
   }
 
@@ -236,13 +235,11 @@ function checkWxAdminAuth(env, request, url) {
   return {
     authorized: false,
     noSecretConfigured: false,
-    reason: adminSecret
-      ? '需要微信管理员密钥（WX_ADMIN_SECRET）才能执行此操作'
-      : '需要访问口令（ACCESS_PASSWORD）才能执行此操作',
+    reason: adminSecret ? '需要微信管理员密钥（WX_ADMIN_SECRET）' : '需要访问口令（ACCESS_PASSWORD）',
   };
 }
 
-// ================= 1. 微信 ClawBot 凭证存取（支持扫码持久化 + 环境变量兜底） =================
+// ================= 1. 微信 ClawBot 凭证存取 =================
 async function getWxCredentials(env, forceRefresh) {
   const now = Date.now();
   if (!forceRefresh && cachedWxCreds && now < cachedWxCredsExp) {
@@ -349,7 +346,7 @@ async function clearWxCredentials(env) {
   await storeDelete(env, WX_CREDS_KEY);
 }
 
-// ================= 2. 游标 (get_updates_buf) 与 Context Token 持久化 =================
+// ================= 2. 游标与 Context Token 持久化 =================
 async function getWxCursor(env, botId) {
   const key = wxSafeId(botId || 'default_bot');
   const cached = mapGetBounded(wxCursors, key, env && env.R2 ? wxCursorsExp : null);
@@ -408,7 +405,7 @@ async function getWxLastPeer(env) {
   return null;
 }
 
-// ================= 3. 入站消息去重（L1 内存 + L2 Blob/KV 滚动窗口） =================
+// ================= 3. 入站消息去重 =================
 async function loadWxDedupWindow(env) {
   try {
     const raw = await storeGet(env, WX_DEDUP_KEY);
@@ -450,7 +447,7 @@ async function releaseWxMsgForRetry(env, msgKey) {
   } catch (e) {}
 }
 
-// ================= 4. “对方正在输入…” 状态管理 =================
+// ================= 4. 输入状态管理 =================
 async function getOrFetchTypingTicket(env, creds, userId, contextToken) {
   const key = wxSafeId(userId);
   const cached = mapGetBounded(wxTypingTickets, key, wxTypingTicketsExp);
@@ -473,7 +470,7 @@ async function sendWxTypingStatus(env, creds, userId, contextToken, status) {
   } catch (e) {}
 }
 
-// ================= 5. 微信文本分段与中英双语口令解析 =================
+// ================= 5. 文本分段与指令解析 =================
 function splitWechatText(text, maxLength = 3800, maxChunks = 5) {
   const chunks = [];
   let remaining = String(text || '').trim();
@@ -498,12 +495,10 @@ function splitWechatText(text, maxLength = 3800, maxChunks = 5) {
   return chunks.length ? chunks : [''];
 }
 
-// 微信端不支持原生 / 斜杠菜单弹窗，因此同时支持 /cmd 与中文自然口令（如「菜单」「模型 2」「清空」「画 一只猫」）
 function parseWxCommand(text) {
   const s = String(text || '').trim();
   if (!s) return null;
 
-  // 1) 标准斜杠命令
   const slash = /^(\/[a-zA-Z]+)(?:\s+([\s\S]*))?$/.exec(s);
   if (slash) {
     const rawCmd = slash[1].toLowerCase();
@@ -513,45 +508,23 @@ function parseWxCommand(text) {
     return { cmd: rawCmd, rest };
   }
 
-  // 2) 中文自然语言口令
-  if (/^(菜单|帮助|指令|功能|命令|使用说明)$/.test(s)) {
-    return { cmd: '/help', rest: '' };
-  }
-  if (/^(模型|模型列表|切换模型|换模型|查看模型)$/.test(s)) {
-    return { cmd: '/model', rest: '' };
-  }
+  if (/^(菜单|帮助|指令|功能|命令|使用说明)$/.test(s)) return { cmd: '/help', rest: '' };
+  if (/^(模型|模型列表|切换模型|换模型|查看模型)$/.test(s)) return { cmd: '/model', rest: '' };
   const modelMatch = /^(?:切换模型|换模型|模型)\s+(.+)$/.exec(s);
-  if (modelMatch) {
-    return { cmd: '/model', rest: modelMatch[1].trim() };
-  }
-  if (/^(模式|切换模式|智能体|智能体模式|普通模式)$/.test(s)) {
-    return { cmd: '/agent', rest: '' };
-  }
-  if (/^(清空|清空上下文|新对话|重置|重置对话|清空记忆上下文)$/.test(s)) {
-    return { cmd: '/clear', rest: '' };
-  }
-  if (/^(记忆|查看记忆|长期记忆)$/.test(s)) {
-    return { cmd: '/memory', rest: '' };
-  }
+  if (modelMatch) return { cmd: '/model', rest: modelMatch[1].trim() };
+  if (/^(模式|切换模式|智能体|智能体模式|普通模式)$/.test(s)) return { cmd: '/agent', rest: '' };
+  if (/^(清空|清空上下文|新对话|重置|重置对话|清空记忆上下文)$/.test(s)) return { cmd: '/clear', rest: '' };
+  if (/^(记忆|查看记忆|长期记忆)$/.test(s)) return { cmd: '/memory', rest: '' };
   const forgetMatch = /^(?:忘掉|删除记忆|清除记忆)\s+(.+)$/.exec(s);
-  if (forgetMatch) {
-    return { cmd: '/forget', rest: forgetMatch[1].trim() };
-  }
-  if (/^(知识库|查看知识库|文档列表)$/.test(s)) {
-    return { cmd: '/kb', rest: '' };
-  }
-  if (/^(状态|连接状态|运行状态|系统状态)$/.test(s)) {
-    return { cmd: '/status', rest: '' };
-  }
+  if (forgetMatch) return { cmd: '/forget', rest: forgetMatch[1].trim() };
+  if (/^(知识库|查看知识库|文档列表)$/.test(s)) return { cmd: '/kb', rest: '' };
+  if (/^(状态|连接状态|运行状态|系统状态)$/.test(s)) return { cmd: '/status', rest: '' };
   const drawMatch = /^(?:画一张|画一幅|画个|画|生成图片|生图)[:：\s]+([\s\S]+)$/.exec(s);
-  if (drawMatch && drawMatch[1].trim()) {
-    return { cmd: '/draw', rest: drawMatch[1].trim() };
-  }
+  if (drawMatch && drawMatch[1].trim()) return { cmd: '/draw', rest: drawMatch[1].trim() };
 
   return null;
 }
 
-// 从图片数据源（二进制、data:image/...、/api/img/<id> 或 https://...）加载字节并加密发送至微信
 async function sendWechatImageFromSource(env, creds, userId, contextToken, source) {
   const chanVer = wxChannelVersion(env);
   let imgBytes = null;
@@ -575,9 +548,7 @@ async function sendWechatImageFromSource(env, creds, userId, contextToken, sourc
     }
   }
 
-  if (!imgBytes || !imgBytes.byteLength) {
-    throw new Error('未能获取到有效图片字节数据');
-  }
+  if (!imgBytes || !imgBytes.byteLength) throw new Error('未能获取到有效图片字节数据');
 
   const res = await ilinkUploadAndSendImage(
     creds.baseurl,
@@ -602,7 +573,7 @@ async function sendWechatImageFromSource(env, creds, userId, contextToken, sourc
 
 const SUPPORTED_DOC_EXT_RE = /\.(md|markdown|txt|csv|tsv|json|jsonl|log|py|js|mjs|ts|tsx|jsx|html|htm|css|xml|yaml|yml|toml|ini|conf|sh|bash|sql|go|rs|java|c|cpp|h)$/i;
 
-// ================= 6. 单条微信入站消息核心处理（口令 + 多模态 + 原图直发 + Agent 循环） =================
+// ================= 6. 单条微信入站消息核心处理 =================
 async function processWechatMessage(env, creds, rawMsg) {
   const parsed = extractWechatMessageContent(rawMsg);
   if (!parsed.isUserMsg || !parsed.fromUserId) return { skipped: true, reason: 'not_user_msg' };
@@ -615,8 +586,6 @@ async function processWechatMessage(env, creds, rawMsg) {
       return { skipped: true, reason: 'user_not_in_whitelist' };
     }
   } else if (creds) {
-    // 若扫码阶段未返回 @im.wechat 格式的 user_id，首次收到消息时自动校准绑定为号主；
-    // 若已绑定明确的 @im.wechat 号主，则拦截其他微信号（可通过 WX_ALLOW_ANY_USER=1 放开）
     if (!creds.ilink_user_id || !creds.ilink_user_id.includes('@im.wechat')) {
       creds.ilink_user_id = userId;
       if (creds.source !== 'env') {
@@ -658,7 +627,6 @@ async function processWechatMessage(env, creds, rawMsg) {
     false
   );
 
-  // 发送经过微信原生排版清洗的文字回复
   const sendReply = async (replyText, skipFormat = false) => {
     const cleanText = skipFormat ? String(replyText || '').trim() : formatWechatText(replyText);
     const chunks = splitWechatText(cleanText, 3800, 5);
@@ -692,7 +660,6 @@ async function processWechatMessage(env, creds, rawMsg) {
     let historyUserText = userText;
     let multimodalContent = null;
 
-    // 处理入站图片消息（支持图+文同时发送，或单独发图）
     if (parsed.imageMedia) {
       try {
         await sendWxTypingStatus(env, creds, userId, contextToken, 1);
@@ -748,7 +715,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         return { processed: true };
       }
     } else if (!userText && parsed.unsupportedMediaType) {
-      await sendReply(`⚠️ 收到${parsed.unsupportedMediaType}，当前通道支持文字、语音转文字、发图识图、画图生成及文本类文档（.md/.txt/.csv/.json/代码）。`, true);
+      await sendReply(`⚠️ 收到${parsed.unsupportedMediaType}，当前通道支持文字、语音转文字、发图识图、画图生成及文本类文档。`, true);
       return { processed: true };
     }
 
@@ -766,7 +733,6 @@ async function processWechatMessage(env, creds, rawMsg) {
 
     const cmd = !multimodalContent ? parseWxCommand(userText) : null;
 
-    // 1) /start 或 /model 或「模型」
     if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
       const arg = cmd.rest.trim();
       if (cmd.cmd === '/model' && arg) {
@@ -780,7 +746,7 @@ async function processWechatMessage(env, creds, rawMsg) {
             || modelObjList.find(m => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q));
         }
         if (!picked) {
-          await sendReply(`⚠️ 未找到匹配的模型「${arg}」。\n请直接发送「模型」或「/model」查看可用模型列表与编号。`, true);
+          await sendReply(`⚠️ 未找到匹配的模型「${arg}」。\n请直接发送「模型」查看可用模型列表。`, true);
           return { processed: true };
         }
         mapSetBounded(wxUserModels, chatId, picked.id, undefined, wxUserModelsExp);
@@ -798,28 +764,25 @@ async function processWechatMessage(env, creds, rawMsg) {
       await sendReply(
         `🟢 EdgeOne-Chat 微信 ClawBot 助手 (v${APP_VERSION})\n`
         + `────────────\n`
-        + `🤖 当前模式：${useAgentNow ? 'Agent 智能体（19 项工具 + 记忆 + 知识库）' : '普通对话模式'}\n`
+        + `🤖 当前模式：${useAgentNow ? 'Agent 智能体' : '普通对话模式'}\n`
         + `🎯 可用模型列表：\n${listLines}\n\n`
-        + `💡 微信快捷口令（无需敲斜杠，直接发中文即可）：\n`
-        + `• 发「模型 序号」（如：模型 2）—— 切换模型\n`
-        + `• 发「画 画面描述」—— AI 生图并直接发原图到微信\n`
-        + `• 发「模式」—— 切换 Agent / 普通对话\n`
-        + `• 发「清空」—— 开启新对话\n`
-        + `• 发「菜单」—— 查看完整功能指南`,
+        + `💡 微信快捷口令：\n`
+        + `• 发「模型 序号」—— 切换模型\n`
+        + `• 发「画 画面描述」—— AI 生图\n`
+        + `• 发「模式」—— 切换 Agent\n`
+        + `• 发「清空」—— 开启新对话`,
         true
       );
       return { processed: true };
     }
 
-    // 2) /clear 或 /new 或「清空」
     if (cmd && (cmd.cmd === '/clear' || cmd.cmd === '/new')) {
       await tgClearHistory(env, chatId);
       await agentClearResumeState(env, chatId);
-      await sendReply('🧹 当前微信会话上下文已清空，可以开始新的话题了。', true);
+      await sendReply('🧹 当前微信会话上下文已清空。', true);
       return { processed: true };
     }
 
-    // 3) /help 或「菜单」「帮助」
     if (cmd && cmd.cmd === '/help') {
       const useAgentNow = await agentGetMode(env, chatId);
       await sendReply(
@@ -827,27 +790,15 @@ async function processWechatMessage(env, creds, rawMsg) {
         + `────────────\n`
         + `📌 当前模型：${activeModelObj.name}\n`
         + `📌 当前模式：${useAgentNow ? '🤖 Agent 智能体模式' : '💬 普通对话模式'}\n\n`
-        + `▎一、中文快捷口令（也可带 / 斜杠）\n`
-        + `• 「模型」或 /model —— 查看模型列表\n`
-        + `• 「模型 2」或 /model 2 —— 切换到第 2 个模型\n`
-        + `• 「画 宇航员猫咪」或 /draw —— 生成图片并直发微信原图\n`
-        + `• 「模式」或 /agent —— 切换 Agent / 普通对话模式\n`
-        + `• 「清空」或 /clear —— 清空对话上下文\n`
-        + `• 「记忆」或 /memory —— 查看长期记忆（平时说「记住…」即可保存）\n`
-        + `• 「忘掉 关键词」或 /forget —— 删除指定记忆\n`
-        + `• 「知识库」或 /kb —— 查看知识库文档与记忆统计\n`
-        + `• 「状态」或 /status —— 查看通道健康度与会话统计\n`
-        + `• 「继续」—— 当长任务暂停时接着完成推理\n\n`
-        + `▎二、多模态能力\n`
-        + `• 🎙️ 发语音：自动语音转文字并回答\n`
-        + `• 🖼️ 发图片：自动解密并进行 Vision 视觉分析\n`
-        + `• 📄 发文件：支持 .md/.txt/.csv/.json/代码文件阅读与存入知识库`,
+        + `• 「模型」—— 查看模型\n`
+        + `• 「画 描述」—— 生图\n`
+        + `• 「记忆」—— 查看记忆\n`
+        + `• 「知识库」—— 查看知识库`,
         true
       );
       return { processed: true };
     }
 
-    // 4) /status 或「状态」
     if (cmd && cmd.cmd === '/status') {
       const useAgentNow = await agentGetMode(env, chatId);
       const mems = await agentGetMemories(env, chatId);
@@ -856,77 +807,58 @@ async function processWechatMessage(env, creds, rawMsg) {
         `📊 微信 ClawBot 运行状态\n`
         + `────────────\n`
         + `• 连接状态：🟢 在线正常\n`
-        + `• 当前模型：${activeModelObj.name} (${activeModelObj.id})\n`
-        + `• 对话模式：${useAgentNow ? '🤖 Agent 智能体模式' : '💬 普通对话模式'}\n`
-        + `• 上下文轮数：${Math.floor(hist.length / 2)} 轮（${hist.length} 条消息）\n`
-        + `• 长期记忆：${mems.length} 条\n`
-        + `• 持久化存储：${env && env.R2 ? '✅ 已接通' : '⚠️ 内存模式'}\n`
+        + `• 当前模型：${activeModelObj.name}\n`
         + `• 累计轮询/回复：${wxDiagMem.totalPolls} 次 / ${wxDiagMem.totalProcessed} 条`,
         true
       );
       return { processed: true };
     }
 
-    // 5) /memory 或「记忆」
     if (cmd && cmd.cmd === '/memory') {
       const mems = await agentGetMemories(env, chatId);
       if (!mems.length) {
-        await sendReply('🧠 暂无长期记忆。\n\n平时直接在对话中对我说「记住xxx」即可永久保存，例如：记住，我喜欢用 Python 写脚本。', true);
+        await sendReply('🧠 暂无长期记忆。直接对我说「记住xxx」即可保存。', true);
       } else {
-        let text = `🧠 长期记忆（共 ${mems.length} 条）：\n────────────\n`;
+        let text = `🧠 长期记忆（共 ${mems.length} 条）：\n`;
         mems.forEach((mm, i) => { text += `${i + 1}. ${mm.fact}\n`; });
-        text += '\n💡 发送「忘掉 关键词」可删除对应记忆。';
         await sendReply(text, true);
       }
       return { processed: true };
     }
 
-    // 6) /kb 或「知识库」
     if (cmd && cmd.cmd === '/kb') {
-      const mems = await agentGetMemories(env, chatId);
       let text = '📚 知识库总览\n────────────\n';
-      text += `🧠 长期记忆：共 ${mems.length} 条（发「记忆」查看，「忘掉 关键词」删除）\n\n`;
       text += await toolListDocs(env);
-      text += '\n\n💾 保存文档：直接上传文档或对我说「把…存成知识库文档」\n🗑️ 删除文档：对我说「删除知识库文档《标题》」';
       await sendReply(text, true);
       return { processed: true };
     }
 
-    // 7) /forget 或「忘掉 关键词」
     if (cmd && cmd.cmd === '/forget') {
       const kw = cmd.rest;
       if (!kw) {
-        await sendReply('用法：发「忘掉 关键词」或「/forget 关键词」\n例如：忘掉 猫 —— 删除所有包含「猫」的记忆', true);
+        await sendReply('用法：发「忘掉 关键词」', true);
       } else {
         const rr = await agentForgetMemory(env, chatId, kw);
-        await sendReply(rr.persistError ? '⚠️ ' + rr.persistError : (rr.removed > 0 ? `🗑 已删除 ${rr.removed} 条包含「${kw}」的记忆。` : `没有找到包含「${kw}」的记忆。`), true);
+        await sendReply(rr.persistError ? '⚠️ ' + rr.persistError : (rr.removed > 0 ? `🗑 已删除 ${rr.removed} 条记忆。` : `未找到相关记忆。`), true);
       }
       return { processed: true };
     }
 
-    // 8) /agent 或「模式」
     if (cmd && cmd.cmd === '/agent') {
       const cur = await agentGetMode(env, chatId);
       await agentSetMode(env, chatId, !cur);
-      await sendReply(
-        !cur
-          ? '🤖 Agent 智能体模式已开启\n\n我会自主规划并调用 19 项工具（🔍 联网搜索、📄 网页抓取、🌐 维基百科、🐙 GitHub、🎓 arXiv、🔥 热榜、💱 汇率/币价、🖧 DNS/IP、🧮 计算、📏 换算、🔤 编码、🌤 天气、🕐 时间），并支持 🧠 长期记忆与 📚 知识库文档读写。'
-          : '💬 已切换为普通对话模式\n\n单轮直接问答，不调用工具、不使用长期记忆。如需切回请再发「模式」或 /agent。',
-        true
-      );
+      await sendReply(!cur ? '🤖 Agent 智能体模式已开启' : '💬 已切换为普通对话模式', true);
       return { processed: true };
     }
 
-    // 9) /draw 或「画 <描述>」—— 自动选择图像模型（或当前模型）生图并加密直发微信原图
     if (cmd && cmd.cmd === '/draw') {
       const drawPrompt = cmd.rest.trim();
       if (!drawPrompt) {
-        await sendReply('🎨 用法：发送「画 画面描述」或「/draw 画面描述」\n例如：画 一只穿宇航服在月球喝咖啡的橘猫，赛博朋克风格', true);
+        await sendReply('🎨 用法：发送「画 画面描述」', true);
         return { processed: true };
       }
       await sendWxTypingStatus(env, creds, userId, contextToken, 1);
 
-      // 优先查找已配置为 /images/generations 的生图模型，或名称含 Paint/Draw/Flux/Image/DALL/Kolors/生图/画图 的模型
       let drawModelId = activeModelId;
       for (const m of modelObjList) {
         const probe = buildAIRequest(env, m.id, [{ role: 'user', content: drawPrompt }], false);
@@ -948,7 +880,7 @@ async function processWechatMessage(env, creds, rawMsg) {
           if (!resp.ok) {
             const errTxt = await readErrorBody(resp, 300);
             await sendWxTypingStatus(env, creds, userId, contextToken, 2);
-            await sendReply(`⚠️ 图像生成接口报错 (HTTP ${resp.status})：${errTxt}`, true);
+            await sendReply(`⚠️ 图像生成接口报错：${errTxt}`, true);
             return { processed: true };
           }
           const imgData = await resp.json();
@@ -958,33 +890,31 @@ async function processWechatMessage(env, creds, rawMsg) {
           const imgSource = item ? (item.b64_json ? ('data:image/png;base64,' + item.b64_json) : item.url) : '';
           await sendWxTypingStatus(env, creds, userId, contextToken, 2);
           if (!imgSource) {
-            await sendReply('⚠️ 图像接口未返回有效图片数据。', true);
+            await sendReply('⚠️ 图像接口未返回有效图片。', true);
             return { processed: true };
           }
           try {
             await sendWechatImageFromSource(env, creds, userId, contextToken, imgSource);
           } catch (uploadErr) {
             if (/^https?:\/\//i.test(imgSource)) {
-              await sendReply(`🎨 图片已生成（微信 CDN 原图投递降级，请点击链接查看）：\n${imgSource}`, true);
+              await sendReply(`🎨 图片已生成：\n${imgSource}`, true);
             } else {
-              await sendReply('⚠️ 微信原图投递失败：' + (uploadErr && uploadErr.message ? uploadErr.message : String(uploadErr)), true);
+              await sendReply('⚠️ 微信原图投递失败：' + uploadErr.message, true);
             }
           }
           return { processed: true };
         } catch (e) {
           await sendWxTypingStatus(env, creds, userId, contextToken, 2);
-          await sendReply('⚠️ 生图请求异常：' + (e && e.message ? e.message : String(e)), true);
+          await sendReply('⚠️ 生图请求异常：' + e.message, true);
           return { processed: true };
         }
       }
-      // 若当前没有配置独立的 /images/generations 渠道，则将 userText 交给当前模型处理
       userText = drawPrompt;
       historyUserText = '画 ' + drawPrompt;
     }
 
     await sendWxTypingStatus(env, creds, userId, contextToken, 1);
 
-    // 检查当前选中的模型本身是否是图像生成接口（/images/generations）
     const modelProbe = buildAIRequest(env, activeModelId, [{ role: 'user', content: userText }], false);
     const isDirectImageModel = !!(modelProbe && modelProbe.isImageAPI);
 
@@ -1007,7 +937,6 @@ async function processWechatMessage(env, creds, rawMsg) {
 
     let wxBudgetMs = parseInt(env.WX_WEBHOOK_BUDGET_MS || env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
     if (!(wxBudgetMs >= 10000)) wxBudgetMs = 55000;
-    if (wxBudgetMs > 240000) wxBudgetMs = 240000;
 
     let lastTypingSent = Date.now();
     const wxCompatApi = async (method) => {
@@ -1052,7 +981,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         r = await runAgentTurn(true);
         if (r.fallback) r = await runAgentTurn(false);
       } catch (e) {
-        r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
+        r = { error: '⚠️ Agent 执行出错：' + e.message };
       }
 
       if (r.error) {
@@ -1060,7 +989,7 @@ async function processWechatMessage(env, creds, rawMsg) {
       } else {
         replyText = r.text;
         if (r.isImage && replyText) {
-          const mUrl = /\((https?:\/\/[^\s)]+|data:image\/[^\s)]+|\/api\/img\/[^\s)]+)\)/.exec(replyText);
+          const mUrl = /\((https?:\/\/[^\s)]+\vert{}data:image\/[^\s)]+\vert{}\/api\/img\/[^\s)]+)\)/.exec(replyText);
           if (mUrl) directImageSource = mUrl[1];
         }
         if (!r.paused) {
@@ -1076,7 +1005,6 @@ async function processWechatMessage(env, creds, rawMsg) {
         }
       }
     } else {
-      // 普通非 Agent 对话、文生图接口或多模态图片问答（复用多密钥轮换池）
       const aiConfig = buildAIRequest(env, activeModelId, history, false);
       if (aiConfig.error) {
         await sendWxTypingStatus(env, creds, userId, contextToken, 2);
@@ -1098,7 +1026,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         } catch (e) {
           aiResponse = null;
           if (attempt >= 2) {
-            agentErr = '⚠️ 上游接口请求失败，请稍后再试。';
+            agentErr = '⚠️ 上游接口请求失败。';
             break;
           }
           await new Promise(r => setTimeout(r, 1500));
@@ -1128,11 +1056,9 @@ async function processWechatMessage(env, creds, rawMsg) {
         } else {
           let diag = '';
           if (aiResponse) {
-            try {
-              diag = `（HTTP ${aiResponse.status}：${await readErrorBody(aiResponse, 300)}）`;
-            } catch (e) {}
+            try { diag = `（HTTP ${aiResponse.status}）`; } catch (e) {}
           }
-          agentErr = (multimodalContent ? '⚠️ 当前模型可能不支持图片识别（请发「模型」切换多模态模型）。' : '⚠️ AI 接口请求失败，请稍后再试。') + diag;
+          agentErr = '⚠️ AI 接口请求失败。' + diag;
         }
       }
     }
@@ -1145,50 +1071,37 @@ async function processWechatMessage(env, creds, rawMsg) {
       return { processed: true };
     }
 
-    // 如果有生成的图片（或者回复中包含 Markdown 图片链接），优先加密上传并作为微信原生图片发送
     if (!directImageSource && replyText) {
-      const mdImgMatch = /!\[[^\]]*\]\((https?:\/\/[^\s)]+|data:image\/[^\s)]+|\/api\/img\/[^\s)]+)\)/.exec(replyText);
+      const mdImgMatch = /!\[[^\]]*\]\((https?:\/\/[^\s)]+\vert{}data:image\/[^\s)]+\vert{}\/api\/img\/[^\s)]+)\)/.exec(replyText);
       if (mdImgMatch) directImageSource = mdImgMatch[1];
     }
 
     if (directImageSource) {
       try {
         await sendWechatImageFromSource(env, creds, userId, contextToken, directImageSource);
-        // 如果除了图片外还有实质性文字说明，一并发送文字
         const textWithoutImg = String(replyText || '')
-          .replace(/\[🖼️ 点击查看生成的图片\]\([^)]+\)/g, '')
           .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
-          .replace(/^🎨 生成的图片：\s*https?:\/\/\S+$/gm, '')
           .trim();
-        if (textWithoutImg) {
-          await sendReply(textWithoutImg);
-        }
+        if (textWithoutImg) await sendReply(textWithoutImg);
         return { processed: true };
       } catch (imgErr) {
-        // 降级为发送文本链接
-        if (replyText) {
-          await sendReply(replyText);
-        } else {
-          await sendReply('⚠️ 微信图片发送失败：' + (imgErr && imgErr.message ? imgErr.message : String(imgErr)), true);
-        }
+        if (replyText) await sendReply(replyText);
+        else await sendReply('⚠️ 微信图片发送失败', true);
         return { processed: true };
       }
     }
 
-    if (replyText) {
-      await sendReply(replyText);
-    }
+    if (replyText) await sendReply(replyText);
     return { processed: true };
   } catch (err) {
     await releaseWxMsgForRetry(env, dedupKey);
     await sendWxTypingStatus(env, creds, userId, contextToken, 2);
-    await wxRecordDiag(env, 'error', err && err.message ? err.message : String(err), userId, true);
+    await wxRecordDiag(env, 'error', err.message, userId, true);
     throw err;
   }
 }
 
-// ================= 7. 长轮询引擎（支持网页自动守护轮询与免开网页保活唤醒） =================
-// 采用轻量级短租约锁（12s），每轮自动续期，支持 force 抢占，彻底解决刷新页面后卡死 35s 的问题
+// ================= 7. 长轮询引擎与加固版自接力逻辑 =================
 async function acquirePollLock(env, ttlMs, force) {
   if (activePollInIsolate && !force) return false;
   activePollInIsolate = true;
@@ -1228,10 +1141,10 @@ async function runWechatPollCycle(env, opts) {
   opts = opts || {};
   const creds = await getWxCredentials(env);
   if (!creds || !creds.bot_token) {
-    return { ok: false, reason: 'not_configured', message: '尚未绑定微信 ClawBot，请先扫码绑定或配置 WX_BOT_TOKEN' };
+    return { ok: false, reason: 'not_configured', message: '尚未绑定微信 ClawBot' };
   }
   if (creds.expired) {
-    return { ok: false, reason: 'session_expired', expired: true, message: creds.errmsg || '微信 ClawBot 会话已过期 (ret=-14)，请重新扫码绑定' };
+    return { ok: false, reason: 'session_expired', expired: true, message: creds.errmsg || '微信会话已过期' };
   }
 
   const maxRuntimeMs = Math.min(Math.max(parseInt(opts.maxRuntimeMs || env.WX_POLL_BUDGET_MS || '25000', 10) || 25000, 3000), 90000);
@@ -1254,21 +1167,12 @@ async function runWechatPollCycle(env, opts) {
       const remainMs = deadline - Date.now();
       if (remainMs < 2200) break;
       const pollTimeout = Math.min(longPollTimeoutMs, Math.max(2200, remainMs - 400));
-      if (round > 0) {
-        await renewPollLock(env, pollTimeout + 2000);
-      }
+      if (round > 0) await renewPollLock(env, pollTimeout + 2000);
 
       const resp = await ilinkGetUpdates(creds.baseurl, creds.bot_token, cursor, chanVer, pollTimeout);
       if (resp && (resp.ret === -14 || resp.errcode === -14)) {
         await markWxSessionExpired(env, creds, resp.errmsg);
-        return {
-          ok: false,
-          reason: 'session_expired',
-          expired: true,
-          received: totalReceived,
-          processed: totalProcessed,
-          message: '微信 ClawBot 会话已过期 (ret=-14)，请重新扫码绑定',
-        };
+        return { ok: false, reason: 'session_expired', expired: true };
       }
 
       if (resp && typeof resp.get_updates_buf === 'string' && resp.get_updates_buf) {
@@ -1283,50 +1187,36 @@ async function runWechatPollCycle(env, opts) {
         try {
           const r = await processWechatMessage(env, creds, m);
           if (r && r.processed) totalProcessed += 1;
-        } catch (err) {
-          console.log('处理微信 ClawBot 消息异常:', err);
-        }
+        } catch (err) {}
       }
 
-      // 关键修复：只有明确要求 singleShot（单次短轮询）时才在首轮后退出；
-      // 周期性保活（Cron / 外部监控 / 连续轮询）即使本轮超时无新消息，也继续下一轮直到填满整个窗口！
       if (opts.singleShot) break;
     }
 
-    return {
-      ok: true,
-      received: totalReceived,
-      processed: totalProcessed,
-      botId: creds.ilink_bot_id,
-      userId: creds.ilink_user_id,
-      lastPollAt: wxDiagMem.lastPollAt,
-    };
+    return { ok: true, received: totalReceived, processed: totalProcessed };
   } catch (e) {
-    await wxRecordDiag(env, 'error', e && e.message ? e.message : String(e), creds.ilink_user_id, true);
-    return {
-      ok: false,
-      error: e && e.message ? e.message : String(e),
-      received: totalReceived,
-      processed: totalProcessed,
-    };
+    await wxRecordDiag(env, 'error', e.message, creds.ilink_user_id, true);
+    return { ok: false, error: e.message };
   } finally {
     await releasePollLock(env);
   }
 }
 
-// 服务端全自动自接力常驻引擎（无需外部监控、无需保持网页打开，扫码后像 Telegram 一样自动在后台收发消息）
+// 【已加固】带重试机制的自接力触发函数，彻底解决偶发网络抖动导致断链的问题
 async function triggerNextSelfRelay(env, origin, hop) {
   try {
     const creds = await getWxCredentials(env);
     if (!creds || !creds.bot_token || creds.expired) return;
     const effOrigin = isRealPublicOrigin(origin) ? origin : (isRealPublicOrigin(creds.relay_origin) ? creds.relay_origin : lastKnownPublicOrigin);
+    if (!isRealPublicOrigin(effOrigin)) return;
+
     const nextHop = ((parseInt(hop, 10) || 0) + 1) % 10000;
 
-    // 1) 若当前进程/容器仍存活（如 EdgeOne Node 实例常驻），150ms 后直接在进程内无缝续跑下一轮
+    // 1) 进程内无缝续期
     setTimeout(() => {
       if (!activePollInIsolate) {
         runWechatPollCycle(env, {
-          maxRuntimeMs: 90000,
+          maxRuntimeMs: 65000,
           longPollTimeoutMs: 22000,
           maxRounds: 4,
           singleShot: false,
@@ -1337,19 +1227,29 @@ async function triggerNextSelfRelay(env, origin, hop) {
       }
     }, 150);
 
-    // 2) 同时通过公网自接力请求唤醒下一个 Serverless 生命周期实例（2.2s 触发即走，不阻塞当前实例退出）
-    if (isRealPublicOrigin(effOrigin)) {
-      const relayToken = computeWxRelayToken(creds.bot_token);
-      const relayUrl = `${effOrigin}/wx-webhook?relay=1&hop=${nextHop}`;
-      await fetch(relayUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Wx-Relay-Token': relayToken,
-        },
-        body: JSON.stringify({ action: 'poll', relay: true, hop: nextHop }),
-        signal: AbortSignal.timeout(2200),
-      }).catch(() => {});
+    // 2) 带有重试与指数退避的公网自接力 HTTP 触发
+    const relayToken = computeWxRelayToken(creds.bot_token);
+    const relayUrl = `${effOrigin}/wx-webhook?relay=1&hop=${nextHop}`;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(relayUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Wx-Relay-Token': relayToken,
+          },
+          body: JSON.stringify({ action: 'poll', relay: true, hop: nextHop }),
+          signal: AbortSignal.timeout(3500),
+        });
+        if (res.ok) break;
+      } catch (err) {
+        if (attempt === 2) {
+          console.warn('[Daemon Relay] 自接力 HTTP 触发失败:', err.message);
+        } else {
+          await new Promise(r => setTimeout(r, 800));
+        }
+      }
     }
   } catch (e) {}
 }
@@ -1396,7 +1296,7 @@ function maybeWakeWxDaemon(request, env, ctx) {
   } catch (e) {}
 }
 
-// ================= 8. Webhook 接收器与全天候免开网页保活端点（GET/POST /wx-webhook） =================
+// ================= 8. Webhook 接收器与全天候保活端点 =================
 async function handleWxWebhook(request, env, url, ctx) {
   const reqUrl = url || new URL(request.url);
   const origin = rememberPublicOrigin(reqUrl.origin);
@@ -1405,7 +1305,6 @@ async function handleWxWebhook(request, env, url, ctx) {
   const isValidRelay = !!(credsForRelay && credsForRelay.bot_token && relayHeader && safeEqual(relayHeader, computeWxRelayToken(credsForRelay.bot_token)));
   const auth = isValidRelay ? { authorized: true, noSecretConfigured: false } : checkWxAdminAuth(env, request, reqUrl);
 
-  // 如果配置了 WX_WEBHOOK_SECRET 或管理员口令，校验权限
   if (env.WX_WEBHOOK_SECRET) {
     const got = request.headers.get('X-Wechat-Webhook-Secret')
       || request.headers.get('X-Webhook-Secret')
@@ -1419,7 +1318,6 @@ async function handleWxWebhook(request, env, url, ctx) {
     return new Response(JSON.stringify({ ok: false, error: auth.reason }), { status: 401, headers: CORS_HEADERS });
   }
 
-  // 支持 GET /wx-webhook?key=... 直接作为外部定时监控（UptimeRobot / 云监控 / Crontab）的全天候保活轮询触发器！
   if (request.method === 'GET') {
     const timeoutMs = parseInt(reqUrl.searchParams.get('timeout_ms') || '50000', 10) || 50000;
     const res = await runWechatPollCycle(env, {
@@ -1435,12 +1333,10 @@ async function handleWxWebhook(request, env, url, ctx) {
     const rawText = (await request.text()).trim();
     const payload = rawText ? JSON.parse(rawText) : {};
 
-    // 如果 POST 请求体为空或显式指定 action=poll，同样执行全窗口连续长轮询
     if (!payload || payload.action === 'poll' || (!payload.msgs && !payload.from_user_id && !payload.user_id && !payload.msg)) {
       const isRelay = !!(payload && payload.relay) || reqUrl.searchParams.get('relay') === '1';
       const hop = parseInt((payload && payload.hop) || reqUrl.searchParams.get('hop') || '1', 10) || 1;
       if (isRelay) {
-        // 异步接力：立即响应上游实例使其干净释放，本实例在后台跑满周期后继续自接力下一棒
         const bgTask = (async () => {
           const r = await runWechatPollCycle(env, {
             maxRuntimeMs: 65000,
@@ -1472,10 +1368,7 @@ async function handleWxWebhook(request, env, url, ctx) {
 
     const creds = await getWxCredentials(env);
     if (!creds || !creds.bot_token) {
-      return new Response(JSON.stringify({ ok: false, error: 'WX_BOT_TOKEN or QR login not configured' }), {
-        status: 200,
-        headers: CORS_HEADERS,
-      });
+      return new Response(JSON.stringify({ ok: false, error: 'WX_BOT_TOKEN not configured' }), { status: 200, headers: CORS_HEADERS });
     }
 
     if (payload && typeof payload.get_updates_buf === 'string' && payload.get_updates_buf) {
@@ -1491,24 +1384,16 @@ async function handleWxWebhook(request, env, url, ctx) {
       try {
         const r = await processWechatMessage(env, creds, m);
         if (r && r.processed) processed += 1;
-      } catch (e) {
-        console.log('Webhook 处理微信消息异常:', e);
-      }
+      } catch (e) {}
     }
 
-    return new Response(JSON.stringify({ ok: true, received: msgs.length, processed }), {
-      status: 200,
-      headers: CORS_HEADERS,
-    });
+    return new Response(JSON.stringify({ ok: true, received: msgs.length, processed }), { status: 200, headers: CORS_HEADERS });
   } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: e && e.message ? e.message : String(e) }), {
-      status: 400,
-      headers: CORS_HEADERS,
-    });
+    return new Response(JSON.stringify({ ok: false, error: e.message }), { status: 400, headers: CORS_HEADERS });
   }
 }
 
-// ================= 9. Web 管理端接口（/api/wx/*，带强制防盗绑鉴权 + 诊断 + 会话同步） =================
+// ================= 9. Web 管理端接口 =================
 function maskToken(token) {
   const s = String(token || '');
   if (s.length <= 12) return s ? '***' : '';
@@ -1522,7 +1407,6 @@ async function handleWxApi(request, env, url, ctx) {
   const defaultBase = normalizeBaseUrl((env && env.WX_BASE_URL) || DEFAULT_ILINK_BASE_URL);
   const auth = checkWxAdminAuth(env, request, url);
 
-  // 1) 查询状态：未通过管理员口令校验时，只返回脱敏的布尔状态与鉴权提示
   if (request.method === 'GET' && path === '/api/wx/status') {
     const creds = await getWxCredentials(env, true);
     const connected = !!(creds && creds.bot_token && !creds.expired);
@@ -1541,9 +1425,7 @@ async function handleWxApi(request, env, url, ctx) {
     const lastPeer = await getWxLastPeer(env);
     const cursor = creds ? await getWxCursor(env, creds.ilink_bot_id) : '';
     const effectiveUserId = (creds && creds.ilink_user_id) || (lastPeer && lastPeer.user_id) || '';
-    const hasContextToken = effectiveUserId
-      ? !!(await getWxContextToken(env, effectiveUserId)) || !!(lastPeer && lastPeer.context_token)
-      : false;
+    const hasContextToken = effectiveUserId ? !!(await getWxContextToken(env, effectiveUserId)) || !!(lastPeer && lastPeer.context_token) : false;
     const diag = await getWxDiagSummary(env);
     return new Response(JSON.stringify({
       ok: true,
@@ -1566,7 +1448,6 @@ async function handleWxApi(request, env, url, ctx) {
     }), { status: 200, headers: CORS_HEADERS });
   }
 
-  // 其余所有操作均要求通过管理员鉴权！
   if (!auth.authorized) {
     return new Response(JSON.stringify({
       ok: false,
@@ -1575,18 +1456,12 @@ async function handleWxApi(request, env, url, ctx) {
     }), { status: auth.noSecretConfigured ? 403 : 401, headers: CORS_HEADERS });
   }
 
-  // 2) 获取微信对话历史（用于在网页侧栏一键同步查看手机微信上的对话）
   if (request.method === 'GET' && path === '/api/wx/history') {
     const creds = await getWxCredentials(env);
     const lastPeer = await getWxLastPeer(env);
     const userId = String(url.searchParams.get('user_id') || (creds && creds.ilink_user_id) || (lastPeer && lastPeer.user_id) || '').trim();
     if (!userId) {
-      return new Response(JSON.stringify({
-        ok: true,
-        userId: '',
-        messages: [],
-        message: '尚未收到过微信端消息，请先在手机微信 ClawBot 中发送一条消息',
-      }), { status: 200, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ ok: true, userId: '', messages: [] }), { status: 200, headers: CORS_HEADERS });
     }
     const chatId = wxSessionChatId(userId);
     const messages = await tgGetHistory(env, chatId);
@@ -1602,31 +1477,20 @@ async function handleWxApi(request, env, url, ctx) {
     }), { status: 200, headers: CORS_HEADERS });
   }
 
-  // 3) 获取微信 ClawBot 扫码绑定二维码（带防覆盖锁）
   if (request.method === 'POST' && path === '/api/wx/qrcode') {
     const existing = await getWxCredentials(env, true);
     if (existing && existing.source === 'env') {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: '当前已通过环境变量 WX_BOT_TOKEN 固定绑定，Web 端扫码已锁定，无法覆盖。',
-      }), { status: 409, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ ok: false, error: '已通过环境变量绑定，扫码已锁定。' }), { status: 409, headers: CORS_HEADERS });
     }
     let body = {};
-    try { body = await request.json(); } catch (e) { body = {}; }
+    try { body = await request.json(); } catch (e) {}
     if (existing && existing.bot_token && !existing.expired && !body.force) {
-      return new Response(JSON.stringify({
-        ok: false,
-        code: 'ALREADY_BOUND',
-        error: '当前已绑定微信账号（' + (existing.ilink_user_id || existing.ilink_bot_id) + '）。为防误覆盖，请先点击「解绑」后再重新扫码。',
-      }), { status: 409, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ ok: false, code: 'ALREADY_BOUND', error: '当前已绑定账号。' }), { status: 409, headers: CORS_HEADERS });
     }
     try {
       const qrData = await ilinkGetQrCode(defaultBase, chanVer, 12000);
       if (!qrData || !qrData.qrcode) {
-        return new Response(JSON.stringify({
-          ok: false,
-          error: '微信 iLink 未返回有效二维码：' + JSON.stringify(qrData || {}),
-        }), { status: 502, headers: CORS_HEADERS });
+        return new Response(JSON.stringify({ ok: false, error: '未返回有效二维码' }), { status: 502, headers: CORS_HEADERS });
       }
       wxQrRedirectNodes.set(qrData.qrcode, defaultBase);
       return new Response(JSON.stringify({
@@ -1637,27 +1501,21 @@ async function handleWxApi(request, env, url, ctx) {
         ret: qrData.ret ?? 0,
       }), { status: 200, headers: CORS_HEADERS });
     } catch (e) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: e && e.message ? e.message : String(e),
-      }), { status: 500, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ ok: false, error: e.message }), { status: 500, headers: CORS_HEADERS });
     }
   }
 
-  // 4) 轮询扫码状态（完整支持 scaned_but_redirect 跨节点自动跳转与 need_verifycode 配对码）
   if (request.method === 'GET' && path === '/api/wx/qrcode-status') {
     const qrcode = (url.searchParams.get('qrcode') || '').trim();
     const verifyCode = (url.searchParams.get('verify_code') || '').trim();
     const clientBase = (url.searchParams.get('base_url') || '').trim();
-    if (!qrcode) {
-      return new Response(JSON.stringify({ ok: false, error: '缺少 qrcode 参数' }), { status: 400, headers: CORS_HEADERS });
-    }
+    if (!qrcode) return new Response(JSON.stringify({ ok: false, error: '缺少 qrcode' }), { status: 400, headers: CORS_HEADERS });
+
     let targetBase = normalizeBaseUrl(clientBase || wxQrRedirectNodes.get(qrcode) || defaultBase);
     try {
       let st = await ilinkGetQrStatus(targetBase, qrcode, chanVer, 8000, verifyCode);
       let status = st.status || 'wait';
 
-      // 若遇到跨区 IDC 节点重定向（scaned_but_redirect / binded_redirect），立即切换到新节点并跟进查询一次
       if ((status === 'scaned_but_redirect' || status === 'binded_redirect' || st.redirect_baseurl) && st.redirect_baseurl) {
         targetBase = st.redirect_baseurl;
         wxQrRedirectNodes.set(qrcode, targetBase);
@@ -1675,11 +1533,7 @@ async function handleWxApi(request, env, url, ctx) {
       if (status === 'confirmed' && st.bot_token) {
         const allowedUsers = parseCommaSeparated(env.WX_ALLOWED_USERS);
         if (allowedUsers.length > 0 && st.ilink_user_id && allowedUsers.indexOf(st.ilink_user_id) === -1) {
-          return new Response(JSON.stringify({
-            ok: false,
-            status: 'rejected',
-            error: `扫码微信号 (${st.ilink_user_id}) 不在 WX_ALLOWED_USERS 白名单中，已拒绝绑定。`,
-          }), { status: 403, headers: CORS_HEADERS });
+          return new Response(JSON.stringify({ ok: false, status: 'rejected', error: '不在白名单中' }), { status: 403, headers: CORS_HEADERS });
         }
 
         const finalBaseUrl = normalizeBaseUrl(st.redirect_baseurl || st.baseurl || targetBase || defaultBase);
@@ -1698,18 +1552,16 @@ async function handleWxApi(request, env, url, ctx) {
         newCreds.relay_origin = origin;
         await saveWxCredentials(env, newCreds);
         await ilinkNotifyStart(newCreds.baseurl, newCreds.bot_token, chanVer, 6000);
-        await wxRecordDiag(env, 'login', `扫码绑定成功 (${newCreds.ilink_user_id || newCreds.ilink_bot_id})，后台自接力守护已启动`, newCreds.ilink_user_id, true);
+        await wxRecordDiag(env, 'login', `扫码绑定成功`, newCreds.ilink_user_id, true);
         wxQrRedirectNodes.delete(qrcode);
         kickWxAutoDaemon(env, ctx, origin);
         return new Response(JSON.stringify({
           ok: true,
           status: 'confirmed',
           persisted: savedOk,
-          r2Bound: !!(env && env.R2),
           botId: newCreds.ilink_bot_id,
           userId: newCreds.ilink_user_id,
           baseUrl: newCreds.baseurl,
-          maskedToken: maskToken(newCreds.bot_token),
         }), { status: 200, headers: CORS_HEADERS });
       }
       return new Response(JSON.stringify({
@@ -1717,26 +1569,19 @@ async function handleWxApi(request, env, url, ctx) {
         status,
         base_url: targetBase,
         need_verifycode: status === 'need_verifycode' || !!st.need_verifycode,
-        ret: st.ret ?? 0,
       }), { status: 200, headers: CORS_HEADERS });
     } catch (e) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: e && e.message ? e.message : String(e),
-      }), { status: 500, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ ok: false, error: e.message }), { status: 500, headers: CORS_HEADERS });
     }
   }
 
-  // 5) 手动、前端后台守护或外部定时触发器触发微信消息长轮询
   if ((request.method === 'POST' || request.method === 'GET') && path === '/api/wx/poll') {
     let body = {};
     if (request.method === 'POST') {
-      try { body = await request.json(); } catch (e) { body = {}; }
+      try { body = await request.json(); } catch (e) {}
     }
     const maxRuntimeMs = parseInt(body.timeout_ms || url.searchParams.get('timeout_ms') || '16000', 10) || 16000;
-    const singleShot = body.single_shot !== undefined
-      ? !!body.single_shot
-      : (url.searchParams.get('single_shot') !== '0');
+    const singleShot = body.single_shot !== undefined ? !!body.single_shot : (url.searchParams.get('single_shot') !== '0');
     const force = !!(body.force || url.searchParams.get('force') === '1');
     const result = await runWechatPollCycle(env, {
       maxRuntimeMs: Math.min(Math.max(maxRuntimeMs, 3000), 85000),
@@ -1748,74 +1593,42 @@ async function handleWxApi(request, env, url, ctx) {
     return new Response(JSON.stringify(result), { status: 200, headers: CORS_HEADERS });
   }
 
-  // 6) 主动向微信用户发送消息（支持在网页控制台一键发测试消息）
   if (request.method === 'POST' && path === '/api/wx/send') {
     let body = {};
     try { body = await request.json(); } catch (e) {
-      return new Response(JSON.stringify({ ok: false, error: '无效的 JSON 请求体' }), { status: 400, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ ok: false, error: '无效请求体' }), { status: 400, headers: CORS_HEADERS });
     }
     const text = String(body.text || '').trim();
-    if (!text) {
-      return new Response(JSON.stringify({ ok: false, error: '消息内容 text 不能为空' }), { status: 400, headers: CORS_HEADERS });
-    }
+    if (!text) return new Response(JSON.stringify({ ok: false, error: '内容不能为空' }), { status: 400, headers: CORS_HEADERS });
+
     const creds = await getWxCredentials(env);
-    if (!creds || !creds.bot_token) {
-      return new Response(JSON.stringify({ ok: false, error: '微信 ClawBot 尚未绑定' }), { status: 400, headers: CORS_HEADERS });
-    }
+    if (!creds || !creds.bot_token) return new Response(JSON.stringify({ ok: false, error: '尚未绑定' }), { status: 400, headers: CORS_HEADERS });
+
     const lastPeer = await getWxLastPeer(env);
     const toUserId = String(body.to_user_id || creds.ilink_user_id || (lastPeer && lastPeer.user_id) || '').trim();
-    if (!toUserId) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: '尚未获取到你的微信对话句柄：请先打开手机微信 -> 我 -> 设置 -> 插件 -> ClawBot，向机器人随便发一句话（如「你好」）以激活对话令牌！',
-      }), { status: 400, headers: CORS_HEADERS });
-    }
-    const contextToken = String(
-      body.context_token
-      || (await getWxContextToken(env, toUserId))
-      || (lastPeer && lastPeer.context_token)
-      || ''
-    ).trim();
-    if (!contextToken) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: '缺少微信会话 context_token（腾讯 iLink 协议规定必须先由手机微信端发起首条消息以签发路由令牌）。请先在手机微信向 ClawBot 发送任意消息！',
-      }), { status: 400, headers: CORS_HEADERS });
-    }
+    const contextToken = String(body.context_token || (await getWxContextToken(env, toUserId)) || (lastPeer && lastPeer.context_token) || '').trim();
+    if (!contextToken) return new Response(JSON.stringify({ ok: false, error: '缺少 context_token' }), { status: 400, headers: CORS_HEADERS });
+
     try {
       const cleanText = formatWechatText(text);
       const r = await ilinkSendMessage(creds.baseurl, creds.bot_token, toUserId, cleanText, contextToken, chanVer, 15000);
       if (r && (r.ret === -14 || r.errcode === -14)) {
         await markWxSessionExpired(env, creds, r.errmsg);
-        return new Response(JSON.stringify({ ok: false, expired: true, error: '会话已过期 (ret=-14)，请重新扫码绑定' }), {
-          status: 401,
-          headers: CORS_HEADERS,
-        });
+        return new Response(JSON.stringify({ ok: false, expired: true, error: '会话已过期' }), { status: 401, headers: CORS_HEADERS });
       }
-      await wxRecordDiag(env, 'reply', `[网页端主动发送] ${cleanText.slice(0, 80)}`, toUserId, true);
-      return new Response(JSON.stringify({ ok: true, to_user_id: toUserId, result: r }), { status: 200, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ ok: true, result: r }), { status: 200, headers: CORS_HEADERS });
     } catch (e) {
-      return new Response(JSON.stringify({ ok: false, error: e && e.message ? e.message : String(e) }), {
-        status: 500,
-        headers: CORS_HEADERS,
-      });
+      return new Response(JSON.stringify({ ok: false, error: e.message }), { status: 500, headers: CORS_HEADERS });
     }
   }
 
-  // 7) 解绑 / 退出当前微信 ClawBot 登录凭证
   if (request.method === 'POST' && path === '/api/wx/logout') {
     const creds = await getWxCredentials(env);
     if (creds && creds.source === 'env') {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: '当前通过环境变量 WX_BOT_TOKEN 绑定，请在控制台移除该变量以解绑。',
-      }), { status: 409, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ ok: false, error: '环境变量绑定无法直接解绑' }), { status: 409, headers: CORS_HEADERS });
     }
-    if (creds && creds.bot_token) {
-      await ilinkNotifyStop(creds.baseurl, creds.bot_token, chanVer, 5000);
-    }
+    if (creds && creds.bot_token) await ilinkNotifyStop(creds.baseurl, creds.bot_token, chanVer, 5000);
     await clearWxCredentials(env);
-    await wxRecordDiag(env, 'login', '管理员主动解绑微信 ClawBot', '', true);
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: CORS_HEADERS });
   }
 
