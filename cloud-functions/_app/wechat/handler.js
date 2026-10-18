@@ -786,17 +786,21 @@ async function processWechatMessage(env, creds, rawMsg) {
     const chunks = splitWechatText(cleanText, 3800, 5);
     for (const chunk of chunks) {
       if (!chunk) continue;
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          const r = await ilinkSendMessage(creds.baseurl, creds.bot_token, userId, chunk, contextToken, chanVer, 15000);
+          const latestCtxToken = (await getWxContextToken(env, userId)) || contextToken;
+          const r = await ilinkSendMessage(creds.baseurl, creds.bot_token, userId, chunk, latestCtxToken, chanVer, 15000);
           if (r && (r.ret === -14 || r.errcode === -14)) {
             await markWxSessionExpired(env, creds, r.errmsg);
             return;
           }
+          if (r && r.ret !== undefined && r.ret !== 0) {
+            throw new Error(`iLink sendmessage ret=${r.ret} ${r.errmsg || ''}`.trim());
+          }
           break;
         } catch (e) {
-          if (attempt === 2) throw e;
-          await new Promise(r => setTimeout(r, 800));
+          if (attempt === 3) throw e;
+          await new Promise(r => { const t = setTimeout(r, 600 * attempt); if (t && typeof t.unref === 'function') t.unref(); });
         }
       }
     }
@@ -1188,8 +1192,14 @@ async function processWechatMessage(env, creds, rawMsg) {
       historyUserText = '画 ' + drawPrompt;
     }
 
-    // 异步非阻塞触发“对方正在输入…”，避免首次获取 typing_ticket 阻塞 AI 推理发起
+    // 异步非阻塞触发“对方正在输入…”并启动 5s 自动续期心跳，确保长推理/生图期间手机端提示不中断
     sendWxTypingStatus(env, creds, userId, contextToken, 1).catch(() => {});
+    const typingHeartbeatTimer = setInterval(() => {
+      sendWxTypingStatus(env, creds, userId, contextToken, 1).catch(() => {});
+    }, 5000);
+    if (typingHeartbeatTimer && typeof typingHeartbeatTimer.unref === 'function') {
+      typingHeartbeatTimer.unref();
+    }
 
     // 检查当前选中的模型本身是否是图像生成接口（/images/generations）
     const modelProbe = buildAIRequest(env, activeModelId, [{ role: 'user', content: userText }], false);
@@ -1344,7 +1354,8 @@ async function processWechatMessage(env, creds, rawMsg) {
       }
     }
 
-    await sendWxTypingStatus(env, creds, userId, contextToken, 2);
+    clearInterval(typingHeartbeatTimer);
+    sendWxTypingStatus(env, creds, userId, contextToken, 2).catch(() => {});
 
     if (agentErr) {
       await wxRecordDiag(env, 'error', agentErr, userId, true);
@@ -1387,21 +1398,22 @@ async function processWechatMessage(env, creds, rawMsg) {
     }
     return { processed: true };
   } catch (err) {
+    try { if (typeof typingHeartbeatTimer !== 'undefined') clearInterval(typingHeartbeatTimer); } catch (e) {}
     await releaseWxMsgForRetry(env, dedupKey);
-    await sendWxTypingStatus(env, creds, userId, contextToken, 2);
+    sendWxTypingStatus(env, creds, userId, contextToken, 2).catch(() => {});
     await wxRecordDiag(env, 'error', err && err.message ? err.message : String(err), userId, true);
     throw err;
   }
 }
 
-// ================= 7. 长轮询引擎（对齐腾讯 iLink 35s 服务端 Hold + 收消息与 AI 解耦自接力） =================
+// ================= 7. 长轮询引擎（对齐腾讯 iLink 35s 服务端 Hold + 流式交棒自接力） =================
 // 核心机制说明：
 // 1) 腾讯 iLink `POST /ilink/bot/getupdates` 在无新消息时固定 Hold 35 秒（longpolling_timeout_ms: 35000）。
 //    客户端超时必须设为 >= 38~40 秒，严禁设为 16s/22s 或发起剩余时间 < 38s 的残缺轮询，
 //    否则客户端提前 Abort 会在腾讯服务端留下 35s 僵尸连接，导致期间用户发来的消息掉进僵尸连接而苦等约 65 秒！
 // 2) 轮询锁租约设为 45 秒（覆盖完整 35s Hold + 5s 余量），且仅包裹 `getupdates + 游标保存` 阶段；
-//    一旦收到消息或完成一轮 35s 空轮询，立即释放轮询锁并触发下一棒自接力（triggerNextSelfRelay），
-//    让下一棒在 200ms 内无缝接上监听新消息，而当前实例专心执行 AI 推理与回复，实现“收发零空窗、接力不断链”！
+//    一旦收到消息或完成一轮 35s 空轮询，立即释放轮询锁并并发启动下一棒自接力（triggerNextSelfRelay），
+//    让下一棒在 100~300ms 内通过 HTTP 流式握手无缝接管监听，当前实例同时执行 AI 推理与回复，并在退出前确保交棒完成！
 const WX_LOCK_DEFAULT_TTL_MS = 45000;
 const WX_MIN_FULL_POLL_MS = 38000;
 const WX_DEFAULT_LONGPOLL_MS = 40000;
@@ -1479,7 +1491,17 @@ async function runWechatPollCycle(env, opts) {
   const maxRounds = Math.min(Math.max(parseInt(opts.maxRounds || '2', 10) || 2, 1), 4);
 
   if (!(await acquirePollLock(env, longPollTimeoutMs + 5000, !!opts.force))) {
-    return { ok: true, locked: true, received: 0, processed: 0, message: '后台长轮询实例正在运行中' };
+    const diagNow = await getWxDiagSummary(env);
+    return {
+      ok: true,
+      locked: true,
+      received: 0,
+      processed: 0,
+      lastPollAt: diagNow.lastPollAt,
+      lastReplyAt: diagNow.lastReplyAt,
+      totalProcessed: diagNow.totalProcessed,
+      message: '后台长轮询实例正在运行中',
+    };
   }
 
   await wxRecordDiag(env, 'poll', '', creds.ilink_user_id, false);
@@ -1489,28 +1511,23 @@ async function runWechatPollCycle(env, opts) {
   let cursor = await getWxCursor(env, creds.ilink_bot_id);
   const chanVer = wxChannelVersion(env);
   let lockReleased = false;
-  let relayTriggered = false;
+  let relayTaskPromise = null;
   const effOrigin = isRealPublicOrigin(opts.origin)
     ? opts.origin
     : (isRealPublicOrigin(creds.relay_origin) ? creds.relay_origin : lastKnownPublicOrigin);
   const currentHop = parseInt(opts.relayHop, 10) || 0;
 
-  const unlockAndRelayIfNeeded = async (shouldRelay) => {
+  const startUnlockAndRelay = async (shouldRelay) => {
     if (!lockReleased) {
       lockReleased = true;
       await releasePollLock(env);
     }
-    if (shouldRelay && opts.autoRelay && !relayTriggered) {
-      relayTriggered = true;
-      // 唤醒下一棒，让新实例立刻接管 getupdates 监听（最多等待 120ms 确保请求已发出，随后不阻塞当前实例后续的 AI 回复）
-      const relayTask = triggerNextSelfRelay(env, effOrigin, currentHop, opts.ctx).catch(() => {});
+    if (shouldRelay && opts.autoRelay && !relayTaskPromise) {
+      // 立即启动下一棒唤醒（与当前实例后续的 AI 推理并行执行，0ms 阻塞；在函数退出前再 await 确保握手必定完成）
+      relayTaskPromise = triggerNextSelfRelay(env, effOrigin, currentHop, opts.ctx).catch(() => {});
       if (opts.ctx && typeof opts.ctx.waitUntil === 'function') {
-        try { opts.ctx.waitUntil(relayTask); } catch (e) {}
+        try { opts.ctx.waitUntil(relayTaskPromise); } catch (e) {}
       }
-      await Promise.race([
-        relayTask,
-        new Promise(r => { const t = setTimeout(r, 120); if (t && typeof t.unref === 'function') t.unref(); }),
-      ]);
     }
   };
 
@@ -1533,7 +1550,7 @@ async function runWechatPollCycle(env, opts) {
       const resp = await ilinkGetUpdates(creds.baseurl, creds.bot_token, cursor, chanVer, pollTimeout);
       if (resp && (resp.ret === -14 || resp.errcode === -14)) {
         await markWxSessionExpired(env, creds, resp.errmsg);
-        await unlockAndRelayIfNeeded(false);
+        await startUnlockAndRelay(false);
         return {
           ok: false,
           reason: 'session_expired',
@@ -1557,19 +1574,28 @@ async function runWechatPollCycle(env, opts) {
       totalReceived += msgs.length;
 
       if (msgs.length > 0) {
+        // 预先提取并保存最新 context_token，确保下一棒或并发回复总能拿到最新上下文令牌
+        for (const rawM of msgs) {
+          try {
+            const p = extractWechatMessageContent(rawM);
+            if (p && p.isUserMsg && p.fromUserId && p.contextToken) {
+              await saveWxContextToken(env, p.fromUserId, p.contextToken);
+            }
+          } catch (e) {}
+        }
         pendingMsgs.push(...msgs);
         // 一旦拿到新消息且新游标已落盘，立即跳出轮询循环！
-        // 先释放轮询锁并触发下一棒接力继续监听 getupdates，再在当前实例执行耗时的 AI 推理与回复！
+        // 先释放轮询锁并并发唤醒下一棒接力继续监听 getupdates，再在当前实例执行 AI 推理与回复！
         break;
       }
 
       if (opts.singleShot) break;
     }
 
-    // 轮询阶段完成：立即释放锁并唤醒下一棒接力监听，实现“零空窗期”
-    await unlockAndRelayIfNeeded(true);
+    // 轮询阶段完成：立即释放锁并并发启动下一棒接力握手，实现“收发零空窗期”
+    await startUnlockAndRelay(true);
 
-    // 紧接着在当前实例生命周期内完成所有入站消息的 AI 推理与微信回复投递
+    // 紧接着在当前实例生命周期内完成所有入站消息的 AI 推理与微信回复投递（与下一棒握手完全并行，0ms 额外延迟）
     for (const m of pendingMsgs) {
       try {
         const r = await processWechatMessage(env, creds, m);
@@ -1579,6 +1605,11 @@ async function runWechatPollCycle(env, opts) {
       }
     }
 
+    // 在当前请求退出前，确保下一棒自接力的 HTTP 握手已经确认完成（流式响应头仅需 ~100ms 即可返回）
+    if (relayTaskPromise) {
+      await relayTaskPromise;
+    }
+
     return {
       ok: true,
       received: totalReceived,
@@ -1586,9 +1617,15 @@ async function runWechatPollCycle(env, opts) {
       botId: creds.ilink_bot_id,
       userId: creds.ilink_user_id,
       lastPollAt: wxDiagMem.lastPollAt,
+      lastReplyAt: wxDiagMem.lastReplyAt,
+      totalProcessed: wxDiagMem.totalProcessed,
     };
   } catch (e) {
-    await unlockAndRelayIfNeeded(true);
+    await new Promise(r => { const t = setTimeout(r, 1500); if (t && typeof t.unref === 'function') t.unref(); });
+    await startUnlockAndRelay(true);
+    if (relayTaskPromise) {
+      await relayTaskPromise;
+    }
     await wxRecordDiag(env, 'error', e && e.message ? e.message : String(e), creds.ilink_user_id, true);
     return {
       ok: false,
@@ -1603,7 +1640,7 @@ async function runWechatPollCycle(env, opts) {
   }
 }
 
-// 服务端全自动自接力常驻引擎（消除 setTimeout 抢锁 Bug 与 waitUntil 30s 腰斩问题）
+// 服务端全自动自接力常驻引擎（流式握手确认 + 容器内常驻自适应兜底）
 async function triggerNextSelfRelay(env, origin, hop, ctx) {
   try {
     const creds = await getWxCredentials(env);
@@ -1614,39 +1651,47 @@ async function triggerNextSelfRelay(env, origin, hop, ctx) {
     let httpRelayDispatched = false;
 
     // 1) 优先通过公网自接力请求唤醒下一个完整的 Serverless 请求生命周期实例
-    //    注意：不设 2.2s 短超时 Abort（避免向新实例发送 RST 中断信号），而是将长连接交由 waitUntil 托管，主流程仅等待 600ms 确认请求已发出
+    //    下游 /wx-webhook?relay=1 采用流式响应，收到请求后立即返回 HTTP 200 响应头与首包心跳，
+    //    因此 await fetch(relayUrl) 在 ~100-300ms 内即可确认下游实例已成功启动！随后将流读取交由 waitUntil 后台保持连接。
     if (isRealPublicOrigin(effOrigin)) {
       const relayToken = computeWxRelayToken(creds.bot_token);
       const relayUrl = `${effOrigin}/wx-webhook?relay=1&hop=${nextHop}`;
-      let immediateFail = false;
-      const relayFetchPromise = fetch(relayUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Wx-Relay-Token': relayToken,
-        },
-        body: JSON.stringify({ action: 'poll', relay: true, hop: nextHop }),
-        signal: AbortSignal.timeout(55000),
-      }).then(res => {
-        if (!res || !res.ok) immediateFail = true;
-        return res ? res.text().catch(() => '') : '';
-      }).catch(() => {
-        immediateFail = true;
-      });
+      try {
+        const fetchTask = fetch(relayUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Wx-Relay-Token': relayToken,
+          },
+          body: JSON.stringify({ action: 'poll', relay: true, hop: nextHop }),
+          signal: AbortSignal.timeout(55000),
+        });
 
-      if (ctx && typeof ctx.waitUntil === 'function') {
-        try { ctx.waitUntil(relayFetchPromise); } catch (e) {}
-      }
-      await Promise.race([
-        relayFetchPromise,
-        new Promise(r => { const t = setTimeout(r, 600); if (t && typeof t.unref === 'function') t.unref(); }),
-      ]);
-      if (!immediateFail) {
-        httpRelayDispatched = true;
+        const res = await Promise.race([
+          fetchTask,
+          new Promise(r => { const t = setTimeout(() => r(null), 1500); if (t && typeof t.unref === 'function') t.unref(); }),
+        ]);
+
+        if (res && res.ok) {
+          httpRelayDispatched = true;
+          const drainStream = res.text().catch(() => '');
+          if (ctx && typeof ctx.waitUntil === 'function') {
+            try { ctx.waitUntil(drainStream); } catch (e) {}
+          }
+        } else if (res === null) {
+          // fetch 仍在建立连接或下游未启用流式首包（如测试桩），继续将其放入 waitUntil 托管
+          httpRelayDispatched = true;
+          const bgFetch = fetchTask.then(r => (r ? r.text().catch(() => '') : '')).catch(() => '');
+          if (ctx && typeof ctx.waitUntil === 'function') {
+            try { ctx.waitUntil(bgFetch); } catch (e) {}
+          }
+        }
+      } catch (e) {
+        httpRelayDispatched = false;
       }
     }
 
-    // 2) 仅当公网自调用因同域限制失败或未配置公网域名（!httpRelayDispatched）时，才启用容器内常驻兜底续跑，彻底杜绝双路互抢！
+    // 2) 仅当公网自调用因同域限制明确失败或未配置公网域名（!httpRelayDispatched）时，启用容器内常驻兜底续跑
     if (!httpRelayDispatched) {
       const fallbackTask = new Promise(resolve => {
         const t = setTimeout(resolve, 300);
@@ -1759,8 +1804,54 @@ async function handleWxWebhook(request, env, url, ctx) {
       const isRelay = !!(payload && payload.relay) || reqUrl.searchParams.get('relay') === '1';
       const hop = parseInt((payload && payload.hop) || reqUrl.searchParams.get('hop') || '1', 10) || 1;
       if (isRelay) {
-        // 关键修复：在当前 HTTP 请求生命周期内直接 await 完成本轮 35s 长轮询（同时注册 waitUntil 双重兜底），
-        // 彻底杜绝在 t=0ms 立即返回 Response 导致 Serverless 平台在 30s 时提前强杀后台轮询任务！
+        // 关键设计：采用 HTTP 流式响应（TransformStream）+ 10s 空白符保活心跳！
+        // 1) 立即刷新 HTTP 200 响应头与 JSON 前缀，使上游棒在 ~100ms 内即可确认本棒已成功接管；
+        // 2) 在本棒完整跑完 35s 长轮询 + 交棒下一跳期间保持 HTTP 响应流开启，彻底规避 Serverless 平台对已关闭响应的 30s waitUntil 强杀限制！
+        if (typeof TransformStream === 'function') {
+          const { readable, writable } = new TransformStream();
+          const writer = writable.getWriter();
+          const enc = new TextEncoder();
+          const streamTask = (async () => {
+            let hbTimer = null;
+            try {
+              await writer.write(enc.encode(`{"ok":true,"relayed":true,"hop":${hop},"result":`));
+              hbTimer = setInterval(() => {
+                writer.write(enc.encode(' ')).catch(() => {});
+              }, 10000);
+              if (hbTimer && typeof hbTimer.unref === 'function') hbTimer.unref();
+
+              const r = await runWechatPollCycle(env, {
+                maxRuntimeMs: 44000,
+                longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
+                maxRounds: 1,
+                singleShot: true,
+                autoRelay: true,
+                origin,
+                relayHop: hop,
+                ctx,
+              });
+              if (hbTimer) clearInterval(hbTimer);
+              await writer.write(enc.encode(`${JSON.stringify(r || { ok: true })}}`));
+            } catch (err) {
+              if (hbTimer) clearInterval(hbTimer);
+              try {
+                await writer.write(enc.encode(`${JSON.stringify({ ok: false, error: String(err && err.message || err) })}}`));
+              } catch (e) {}
+            } finally {
+              try { await writer.close(); } catch (e) {}
+            }
+          })();
+
+          if (ctx && typeof ctx.waitUntil === 'function') {
+            try { ctx.waitUntil(streamTask); } catch (e) {}
+          }
+          const streamHeaders = Object.assign({}, CORS_HEADERS, {
+            'Cache-Control': 'no-store, no-transform',
+            'X-Accel-Buffering': 'no',
+          });
+          return new Response(readable, { status: 200, headers: streamHeaders });
+        }
+
         const relayCycleTask = runWechatPollCycle(env, {
           maxRuntimeMs: 44000,
           longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,

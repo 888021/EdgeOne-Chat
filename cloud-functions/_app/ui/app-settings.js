@@ -440,8 +440,10 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       });
       const data = await res.json();
       if (data && data.ok) {
-        wxPollNowBtn.textContent = '✅ 已处理 ' + (data.processed || 0) + ' 条';
-        if (data.processed > 0) await syncWechatHistoryToWeb(false);
+        wxPollNowBtn.textContent = data.locked
+          ? '🟢 后台实时监听中'
+          : ('✅ 已处理 ' + (data.processed || 0) + ' 条');
+        await syncWechatHistoryToWeb(false);
       } else {
         wxPollNowBtn.textContent = '⚠️ ' + ((data && (data.error || data.message)) || '未就绪');
       }
@@ -491,6 +493,9 @@ export default `  const settingsModal = document.getElementById('settingsModal')
     }
   }
 
+  let wxLastSeenReplyAt = 0;
+  let wxLastSeenTotalProcessed = 0;
+
   async function runWxLivePollLoop() {
     if (wxLiveLoopRunning) return;
     wxLiveLoopRunning = true;
@@ -513,7 +518,13 @@ export default `  const settingsModal = document.getElementById('settingsModal')
         } else {
           wxIsConnectedState = true;
           if (wxOnlineBadge) wxOnlineBadge.style.display = 'block';
-          if (data && data.processed > 0) {
+          const replyAdvanced = !!(data && data.lastReplyAt && data.lastReplyAt > wxLastSeenReplyAt);
+          const countAdvanced = !!(data && typeof data.totalProcessed === 'number' && data.totalProcessed > wxLastSeenTotalProcessed);
+          if (data && data.lastReplyAt > wxLastSeenReplyAt) wxLastSeenReplyAt = data.lastReplyAt;
+          if (data && typeof data.totalProcessed === 'number' && data.totalProcessed > wxLastSeenTotalProcessed) {
+            wxLastSeenTotalProcessed = data.totalProcessed;
+          }
+          if ((data && data.processed > 0) || replyAdvanced || countAdvanced) {
             await syncWechatHistoryToWeb(false);
             if (wxModal && wxModal.classList.contains('active') && wxSessionUnlocked) {
               await refreshWxStatus(true);

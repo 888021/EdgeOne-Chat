@@ -191,7 +191,17 @@ async function ilinkGetUpdates(baseUrl, token, getUpdatesBuf, channelVersion, ti
   } catch (e) {
     const nm = (e && e.name) ? String(e.name) : '';
     const msg = String((e && e.message) || '');
-    if (nm === 'AbortError' || nm === 'TimeoutError' || /abort|timeout/i.test(msg)) {
+    const st = (e && typeof e.status === 'number') ? e.status : 0;
+    // 客户端超时或上游网关长轮询空转超时（502/503/504/524）均视为正常空轮询控制流，保留原游标继续下一轮
+    if (
+      nm === 'AbortError'
+      || nm === 'TimeoutError'
+      || /abort|timeout/i.test(msg)
+      || st === 502 || st === 503 || st === 504 || st === 524
+    ) {
+      if (st >= 500) {
+        await new Promise(r => { const t = setTimeout(r, 1200); if (t && typeof t.unref === 'function') t.unref(); });
+      }
       return { ret: 0, msgs: [], get_updates_buf: String(getUpdatesBuf || ''), timedOut: true };
     }
     throw e;
