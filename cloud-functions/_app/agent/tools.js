@@ -1,9 +1,9 @@
-// Agent 工具定义与分发（全套无配置增强：共 19 个零密钥工具 + L1 结果缓存与并发去重）
+// Agent 工具定义与分发（全套无配置增强：共 20 个零密钥工具 + L1 结果缓存与并发去重）
 
 import { toolWebSearch, toolWebFetch, toolGithubLookup, toolArxivSearch, toolTrendingNews, clearWebPageCache } from './tools-web.js';
 import { toolCalculate, toolGetTime, toolGetWeather, toolExchangeRate, toolWikiLookup, toolUnitConvert, toolTextToolkit, toolNetworkLookup } from './tools-local.js';
 import { agentSaveMemory, agentForgetMemory } from './memory.js';
-import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
+import { toolSaveDoc, toolListDocs, toolSearchDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
 import { isToolFailure } from './result.js';
 
 // ==================== 工具结果 L1 缓存与同参并发去重 ====================
@@ -56,7 +56,7 @@ function getAgentToolCacheStats() {
   return { size: toolResultCache.size, inFlight: inFlightTools.size, hits: cacheHits, misses: cacheMisses };
 }
 
-// ==================== Agent 工具定义（共 19 项零密钥工具） ====================
+// ==================== Agent 工具定义（共 20 项零密钥工具） ====================
 function getAgentTools(kbReadOnly) {
   const tools = [
     {
@@ -309,20 +309,35 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'list_docs',
-        description: '列出知识库文档（R2 kb/docs/ 下所有文档的标题）。用户问题可能涉及之前保存的文档主题时，先调用它确认有没有相关文档；有则用 read_doc 细读。',
+        description: '列出知识库文档（标题 + 体积 + 更新时间，按最近更新排序）。想通览有哪些文档时用；只知道主题、不确定是哪一篇时，用 search_docs 按关键词检索全文更准。',
         parameters: { type: 'object', properties: {} }
       }
     },
     {
       type: 'function',
       function: {
-        name: 'read_doc',
-        description: '按标题或关键词读取知识库文档（单次返回 8000 字，超长文档可传 offset 分页续读）。query 给标题或关键词；标题对不上时会自动用多关键词分词检索全库正文并返回最相关的 Top 3 片段及 offset。读到相关内容后优先引用，并注明"据知识库文档《xxx》"。',
+        name: 'search_docs',
+        description: '在知识库全部文档里做全文检索（标题 + 正文，支持多关键词与中文 2-gram），返回相关性最高的若干片段，以及所属文档名与该片段在全文中的 offset。当你想确认"知识库里有没有讲过 X"、或不确定该读哪一篇时，先用它；已知确切标题要读整篇时用 read_doc。',
         parameters: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: '文档标题或多关键词（支持空格分隔），如"甲骨文 ARM 放货"' },
-            offset: { type: 'integer', description: '可选：读取起始字符偏移量（默认 0），用于长文档翻页或跳转到检索命中的 offset' }
+            query: { type: 'string', description: '检索关键词，可空格分隔多个词，如"回源 超时 重试"' },
+            count: { type: 'integer', description: '可选：返回片段数，1-8，默认 3' }
+          },
+          required: ['query']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_doc',
+        description: '按标题读取知识库文档正文（单次返回 8000 字）。文档比一页长时，首次返回会附带【章节目录】（含每节的 offset），可直接传 offset 跳到需要的章节，不必逐页翻。query 给标题；标题对不上时会自动退回全库检索并返回最相关的 Top 3 片段。',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: '文档标题（推荐给完整标题），或标题关键词' },
+            offset: { type: 'integer', description: '可选：读取起始字符偏移量（默认 0），用于跳转到目录里的某一节或翻页' }
           },
           required: ['query']
         }
@@ -377,6 +392,7 @@ async function runRawAgentTool(name, args, env, chatId) {
     }
     case 'save_doc': return await toolSaveDoc(env, chatId, args);
     case 'list_docs': return await toolListDocs(env);
+    case 'search_docs': return await toolSearchDocs(env, args);
     case 'read_doc': return await toolReadDoc(env, args);
     case 'delete_doc': return await toolDeleteDoc(env, args);
     default: return '未知工具: ' + name;

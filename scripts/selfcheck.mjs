@@ -1951,18 +1951,18 @@ async function main() {
     }
   });
 
-  console.log('\n=== 13. Agent 性能加速与 19 项零密钥工具自检 ===');
+  console.log('\n=== 13. Agent 性能加速与 20 项零密钥工具自检 ===');
 
   const agentToolsMod = await import('../cloud-functions/_app/agent/tools.js');
   const toolsLocalMod = await import('../cloud-functions/_app/agent/tools-local.js');
   const toolsWebMod = await import('../cloud-functions/_app/agent/tools-web.js');
   const limitsMod = await import('../cloud-functions/_app/agent/limits.js');
 
-  await checkAsync('Agent 工具箱共注册 19 项工具（Web 只读模式自动过滤 4 项写入工具剩 15 项）', () => {
+  await checkAsync('Agent 工具箱共注册 20 项工具（Web 只读模式自动过滤 4 项写入工具剩 16 项）', () => {
     const allTools = agentToolsMod.getAgentTools(false);
     const roTools = agentToolsMod.getAgentTools(true);
-    assert.equal(allTools.length, 19);
-    assert.equal(roTools.length, 15);
+    assert.equal(allTools.length, 20);
+    assert.equal(roTools.length, 16);
     const names = allTools.map(t => t.function.name);
     for (const expected of ['unit_convert', 'text_toolkit', 'network_lookup', 'github_lookup', 'arxiv_search', 'trending_news']) {
       assert.ok(names.includes(expected), '应包含新工具 ' + expected);
@@ -2560,6 +2560,153 @@ async function main() {
     assert.equal(typeof j.debug.agent.avgSteps, 'number');
     assert.ok(j.debug.agent.cache && typeof j.debug.agent.cache.hits === 'number');
     assert.equal(/sk-|Bearer /.test(JSON.stringify(j.debug.agent)), false, '统计里不得出现密钥原文');
+  });
+
+  console.log('\n=== 16. 知识库读取链路（全库检索 / 章节跳读 / 多候选 / 单字噪音） ===');
+
+  const kbRegMod = await import('../cloud-functions/_app/kb/registry.js');
+  const kbEnv = { R2: blobBackend.makeBlobBackend(fakeBlobStore()) };
+
+  // 造 45 篇普通文档，把唯一关键词埋在第 40 篇的「正文」里（标题里不含它）。
+  // 旧实现 reg.slice(0, 30) 只扫前 30 篇，这一篇永远检索不到，而且界面上看不出来。
+  for (let i = 1; i <= 45; i++) {
+    const isTarget = i === 40;
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', {
+      title: isTarget ? '技术笔记 40' : '技术笔记 ' + String(i).padStart(2, '0'),
+      content: isTarget
+        ? '玄武岩纤维是一种无机纤维，耐高温、耐腐蚀，常用于复合筋材。'.repeat(10)
+        : '这是第 ' + i + ' 篇的正文，讲的是常规内容，没有任何稀有名词。'.repeat(6),
+    });
+  }
+
+  await checkAsync('中文检索分词不再产出单字 token（"的/不/在" 不再制造假命中）', () => {
+    const tk = docTools.docSearchTokens('玄武岩纤维');
+    assert.equal(tk.some(t => t.length === 1), false, '两字以上的中文查询不该拆出单字');
+    assert.ok(tk.includes('玄武岩纤维'));
+    assert.ok(tk.includes('玄武'));
+    // 整串就是单字时才保留单字，否则「查一个汉字」会失效
+    assert.deepEqual(docTools.docSearchTokens('库'), ['库']);
+    // 停用字混在长查询里，不应作为独立 token 进入打分
+    assert.equal(docTools.docSearchTokens('知识库的使用说明').includes('的'), false);
+  });
+
+  await checkAsync('全文检索扫全库：第 40 篇正文里的关键词能命中（旧实现只扫前 30 篇）', async () => {
+    const r = await docTools.kbSearchDocs(kbEnv, '玄武岩纤维', { topN: 3 });
+    assert.equal(r.ok, true);
+    assert.ok(r.total >= 45, '注册表应有 45 篇以上，实际 ' + r.total);
+    assert.equal(r.scanned, r.total, '小知识库应扫完全部（' + r.scanned + '/' + r.total + '）');
+    assert.equal(r.truncated, false);
+    assert.equal(r.hits.length, 1, '只有第 40 篇含该词');
+    assert.equal(r.hits[0].title, '技术笔记 40');
+    assert.ok(r.hits[0].bestOffset > 0);
+  });
+
+  await checkAsync('检索结果如实回报扫描范围，不说"知识库里没有"却只扫了一部分', async () => {
+    const r = await docTools.kbSearchDocs(kbEnv, '根本不存在的词组', { topN: 3 });
+    assert.equal(r.ok, true);
+    assert.equal(r.hits.length, 0);
+    assert.equal(r.scanned, r.total);
+    const msg = await docTools.toolSearchDocs(kbEnv, { query: '根本不存在的词组' });
+    assert.match(msg, /知识库中未找到与「根本不存在的词组」相关的内容/);
+    assert.match(msg, new RegExp('已扫描 ' + r.scanned + '/' + r.total + ' 篇'));
+    assert.match(msg, /list_docs/);
+  });
+
+  await checkAsync('search_docs 已注册进工具表，且与 read_doc 回落分支共用同一套打分', async () => {
+    const names = agentToolsMod.getAgentTools(false).map(t => t.function.name);
+    assert.ok(names.includes('search_docs'), '工具表应包含 search_docs');
+    assert.ok(names.includes('read_doc') && names.includes('list_docs'));
+    const viaTool = await agentToolsMod.execAgentTool('search_docs', { query: '玄武岩纤维' }, kbEnv, 'web_kb', false);
+    assert.match(viaTool, /【命中 1：知识库文档《技术笔记 40》/);
+    assert.match(viaTool, /offset=/);
+    assert.match(viaTool, /read_doc/);
+    const empty = await agentToolsMod.execAgentTool('search_docs', { query: '' }, kbEnv, 'web_kb', false);
+    assert.match(empty, /关键词为空/);
+  });
+
+  await checkAsync('kbBestWindow 贴着真实命中取窗口（不再按固定步长切网格）', () => {
+    const filler = '无关内容'.repeat(300); // 1200 字符
+    const text = filler + '目标关键词 目标关键词 目标关键词' + filler;
+    const win = docTools.kbBestWindow(text, ['目标关键词'], 1200);
+    assert.ok(win, '有命中就应返回窗口');
+    assert.equal(win.anchor, filler.length, '窗口锚点应落在首个命中处');
+    assert.equal(win.score, 45, '3 次命中 × 词长 5 × 权重 3');
+    assert.equal(docTools.kbBestWindow('完全无关的正文', ['目标关键词'], 1200), null);
+  });
+
+  await checkAsync('kbBuildToc 抽 h1~h4 标题并给出可跳读的绝对 offset', () => {
+    const text = '# 一级标题\n\n正文\n\n## 二级标题\n\n更多正文\n\n#### 四级标题\n';
+    const toc = docTools.kbBuildToc(text, 12);
+    assert.equal(toc.length, 3);
+    assert.equal(toc[0].level, 1);
+    assert.equal(toc[0].offset, 0);
+    assert.equal(toc[1].title, '二级标题');
+    assert.equal(toc[1].offset, text.indexOf('## 二级标题'));
+    assert.equal(toc[2].level, 4);
+    assert.equal(docTools.kbBuildToc('没有任何小标题的正文', 12).length, 0);
+  });
+
+  await checkAsync('read_doc 首次读长文档附【章节目录】，按目录 offset 跳读不再回放目录', async () => {
+    const body = '# 第一节 概述\n\n' + 'A'.repeat(3000)
+      + '\n\n## 1.1 细节\n\n' + 'B'.repeat(3000)
+      + '\n\n## 1.2 结论\n\n' + 'C'.repeat(3000);
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', { title: '长文档测试', content: body });
+
+    const first = await docTools.toolReadDoc(kbEnv, { query: '长文档测试' });
+    assert.match(first, /【章节目录】/);
+    assert.match(first, /1\.1 细节（offset=\d+）/);
+    assert.match(first, /1\.2 结论（offset=\d+）/);
+    assert.match(first, /可传 offset 顺序阅读|可直接传对应 offset 跳到该节/);
+
+    const off = parseInt(first.match(/1\.1 细节（offset=(\d+)）/)[1], 10);
+    assert.ok(off > 3000, '第二节 offset 应越过第一节正文，实际 ' + off);
+    const second = await docTools.toolReadDoc(kbEnv, { query: '长文档测试', offset: off });
+    assert.equal(/【章节目录】/.test(second), false, '翻页时不该再回放目录');
+    assert.match(second, /B{50}/, '跳读应落在 1.1 节正文');
+    assert.match(second, /已读到文档末尾|offset=/);
+  });
+
+  await checkAsync('标题模糊命中多篇时给出「另有 N 篇标题相近」提示（不静默读错）', async () => {
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', { title: 'ARM 架构', content: 'ARM 是精简指令集架构，主打低功耗。'.repeat(20) });
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', { title: '甲骨文 ARM 放货', content: '甲骨文云 ARM 实例放货时间与抢购经验。'.repeat(20) });
+
+    const reg = await kbRegMod.kbGetRegistry(kbEnv);
+    const cand = kbRegMod.kbFindRegCandidates(reg, 'ARM');
+    assert.equal(cand.length, 2, '两篇标题都含 ARM，应都作为候选');
+    assert.equal(cand[0].title, 'ARM 架构', '同等可信度时按注册表顺序取第一篇');
+    // 精确标题必须排在最前，不被"包含"候选抢走
+    assert.equal(kbRegMod.kbFindRegCandidates(reg, '甲骨文 ARM 放货')[0].title, '甲骨文 ARM 放货');
+
+    const msg = await docTools.toolReadDoc(kbEnv, { query: 'ARM' });
+    assert.match(msg, /【知识库文档《ARM 架构》】/);
+    assert.match(msg, /另有 1 篇标题相近的文档：《甲骨文 ARM 放货》/);
+  });
+
+  await checkAsync('list_docs 按更新时间倒序、带体积与日期，超 40 篇截断并指向 search_docs', async () => {
+    // 时间戳是毫秒级，同毫秒内保存的两篇排序不可判定，这里故意错开 5ms 造出"最新"
+    await new Promise(r => setTimeout(r, 5));
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', { title: '最新入库的文档', content: '用来验证列表按更新时间倒序。' });
+    const msg = await docTools.toolListDocs(kbEnv);
+    assert.match(msg, /共\d+篇，按更新时间倒序，显示前 40 篇/);
+    assert.match(msg, /技术笔记 40（\d+ KB，\d{4}-\d{2}-\d{2}）/);
+    assert.match(msg, /用 search_docs 按关键词检索全文/);
+    assert.match(msg.split('\n')[1], /^1\. 最新入库的文档/, '最新保存的应排最前');
+  });
+
+  await checkAsync('search_docs 的结果上限单独放宽到 6000（3 段片段 + 续读提示不会被砍掉）', () => {
+    assert.equal(limitsMod.toolResultMax({}, 'search_docs'), 6000);
+    // 显式配置仍然整体覆盖
+    assert.equal(limitsMod.toolResultMax({ AGENT_TOOL_RESULT_MAX: '2000' }, 'search_docs'), 2000);
+    assert.equal(limitsMod.toolResultMax({}, 'read_doc'), 8500);
+  });
+
+  await checkAsync('delete_doc 命中多篇时明确告知只删了哪一篇（删除不可逆，不顺手删）', async () => {
+    const msg = await docTools.toolDeleteDoc(kbEnv, { query: 'ARM' });
+    assert.match(msg, /已删除知识库文档《ARM 架构》/);
+    assert.match(msg, /另有 1 篇标题相近的文档未删除：《甲骨文 ARM 放货》/);
+    const reg = await kbRegMod.kbGetRegistry(kbEnv);
+    assert.equal(reg.some(e => e.title === '甲骨文 ARM 放货'), true, '相近标题的文档不能被顺手删掉');
+    assert.equal(reg.some(e => e.title === 'ARM 架构'), false);
   });
 
   console.log('\n=== 结果 ===');
