@@ -4,6 +4,7 @@ import { toolWebSearch, toolWebFetch, toolGithubLookup, toolArxivSearch, toolTre
 import { toolCalculate, toolGetTime, toolGetWeather, toolExchangeRate, toolWikiLookup, toolUnitConvert, toolTextToolkit, toolNetworkLookup } from './tools-local.js';
 import { agentSaveMemory, agentForgetMemory } from './memory.js';
 import { toolSaveDoc, toolListDocs, toolSearchDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
+import { clearKbPrefetchCache } from '../kb/prefetch.js';
 import { isToolFailure } from './result.js';
 
 // ==================== 工具结果 L1 缓存与同参并发去重 ====================
@@ -22,6 +23,11 @@ const TOOL_CACHE_TTL_BY_NAME = {
   arxiv_search: 10 * 60 * 1000,
   trending_news: 3 * 60 * 1000,
   network_lookup: 5 * 60 * 1000,
+  // 知识库只读检索：同一轮里模型常常「换个措辞再查一遍」，缓存 30 秒既省掉整库重扫，
+  // 又不会让刚保存的文档长时间看不到（TTL 远小于「读一次就忘」的容忍度）。
+  search_docs: 30 * 1000,
+  read_doc: 30 * 1000,
+  list_docs: 30 * 1000,
 };
 
 const toolResultCache = new Map();
@@ -48,6 +54,8 @@ function clearAgentToolCache() {
   toolResultCache.clear();
   inFlightTools.clear();
   clearWebPageCache();
+  // 知识库预检索的 60 秒缓存也一起失效，否则刚保存的文档在 Web 端要等一分钟才「出现」
+  try { clearKbPrefetchCache(); } catch (e) {}
   cacheHits = 0;
   cacheMisses = 0;
 }
@@ -390,11 +398,21 @@ async function runRawAgentTool(name, args, env, chatId) {
         ? '已删除 ' + rr.removed + ' 条包含「' + kw + '」的长期记忆'
         : '未找到包含「' + kw + '」的长期记忆';
     }
-    case 'save_doc': return await toolSaveDoc(env, chatId, args);
+    case 'save_doc': {
+      const r = await toolSaveDoc(env, chatId, args);
+      // 知识库内容变了：立刻清掉 list_docs / search_docs / read_doc 的 L1 缓存，
+      // 否则刚保存的文档在 30 秒内「查不到」，用户会以为没存上。
+      if (String(r).startsWith('已保存')) clearAgentToolCache();
+      return r;
+    }
     case 'list_docs': return await toolListDocs(env);
     case 'search_docs': return await toolSearchDocs(env, args);
     case 'read_doc': return await toolReadDoc(env, args);
-    case 'delete_doc': return await toolDeleteDoc(env, args);
+    case 'delete_doc': {
+      const r = await toolDeleteDoc(env, args);
+      if (String(r).startsWith('已删除')) clearAgentToolCache();
+      return r;
+    }
     default: return '未知工具: ' + name;
   }
 }

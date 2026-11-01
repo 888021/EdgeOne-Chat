@@ -208,7 +208,10 @@ export default `</head>
               {{MODEL_OPTIONS}}
             </select>
           </div>
-          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 或微信 ClawBot 机器人">🤖 Agent</button>
+          <div class="toggle-group">
+            <button class="agent-toggle" id="kbToggle" title="优先读取知识库：回答前先检索知识库文档，命中就据此作答并注明出处；关闭后不再检索（Agent 模式下仍可按需调用知识库工具）"><span class="at-ico">📚</span><span class="at-lbl">知识库</span></button>
+            <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 或微信 ClawBot 机器人"><span class="at-ico">🤖</span><span class="at-lbl">Agent</span></button>
+          </div>
         </div>
       </div>
       <div class="disclaimer">AI 生成的内容可能不准确，请核实重要信息。</div>

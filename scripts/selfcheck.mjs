@@ -2709,6 +2709,193 @@ async function main() {
     assert.equal(reg.some(e => e.title === 'ARM 架构'), false);
   });
 
+  console.log('\n=== 17. Web 优先读知识库（预检索 / 双模式注入 / 前端开关） ===');
+
+  const prefetchMod = await import('../cloud-functions/_app/kb/prefetch.js');
+  const promptMod = await import('../cloud-functions/_app/agent/prompt.js');
+  // uiMod 在第 10 节已导入，这里直接复用（同一模块实例）
+
+  const webKbEnv = {
+    R2: blobBackend.makeBlobBackend(fakeBlobStore()),
+    API_URL_1: 'https://up.example/v1/chat/completions',
+    MODEL_1: 'm1:测试模型',
+    API_KEY_1: 'k1',
+  };
+  await docTools.toolSaveDoc(webKbEnv, 'web_prefetch', {
+    title: '甲骨文云 ARM 免费额度',
+    content: '# 免费额度\n\n甲骨文云 ARM 实例每月提供 4 核 24G 的永久免费额度，需要信用卡验证。\n\n## 抢购技巧\n\n凌晨放货概率更高。',
+  });
+
+  await checkAsync('预检索跳过规则：闲聊 / 过短 / 空问题都不去扫库（省下 1~2 秒）', () => {
+    assert.equal(prefetchMod.kbPrefetchGate('你好').reason, 'chitchat');
+    assert.equal(prefetchMod.kbPrefetchGate('谢谢！').reason, 'chitchat');
+    assert.equal(prefetchMod.kbPrefetchGate('嗯').reason, 'chitchat');
+    assert.equal(prefetchMod.kbPrefetchGate('a').reason, 'too_short');
+    assert.equal(prefetchMod.kbPrefetchGate('   ').reason, 'empty');
+    assert.equal(prefetchMod.kbPrefetchGate('甲骨文云免费额度').ok, true);
+  });
+
+  await checkAsync('预检索命中：片段带文档标题、剥掉 frontmatter、明确要求注明出处', async () => {
+    prefetchMod.clearKbPrefetchCache();
+    const r = await prefetchMod.kbPrefetch(webKbEnv, '甲骨文云 ARM 免费额度怎么申请', { topN: 2 });
+    assert.equal(r.ok, true);
+    assert.match(r.text, /【知识库预检索结果】/);
+    assert.match(r.text, /《甲骨文云 ARM 免费额度》/);
+    assert.match(r.text, /4 核 24G/);
+    assert.equal(/title:/.test(r.text), false, '片段里不该出现 frontmatter');
+    assert.match(r.text, /不要用相同关键词重复 search_docs/);
+    assert.equal(r.scanned, r.total, '小知识库应扫完全部');
+  });
+
+  await checkAsync('同一问题第二次预检索走缓存（前端断流重试不再扫库）', async () => {
+    const q = '甲骨文云 ARM 免费额度怎么申请';
+    const r1 = await prefetchMod.kbPrefetch(webKbEnv, q);
+    const r2 = await prefetchMod.kbPrefetch(webKbEnv, q);
+    assert.equal(r2.cached, true);
+    assert.equal(r2.text, r1.text);
+  });
+
+  await checkAsync('预检索无命中时如实返回 no_hit，不编造片段', async () => {
+    const r = await prefetchMod.kbPrefetch(webKbEnv, '量子色动力学的渐近自由', { topN: 2 });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'no_hit');
+    assert.equal(r.text, '');
+  });
+
+  await checkAsync('系统提示词：有预检索时注入片段并改写作答顺序，没有时不出现该段', () => {
+    const withPre = promptMod.buildAgentSystemPrompt(
+      [], '甲骨文云额度', [{ title: '甲骨文云 ARM 免费额度', file: 'a.md' }], true,
+      '【知识库预检索结果】片段正文'
+    );
+    assert.match(withPre, /【知识库预检索结果】片段正文/);
+    assert.match(withPre, /先读完它/);
+    assert.match(withPre, /不要凭印象补充成/);
+
+    const noPre = promptMod.buildAgentSystemPrompt(
+      [], '甲骨文云额度', [{ title: '甲骨文云 ARM 免费额度', file: 'a.md' }], true, ''
+    );
+    assert.equal(/【知识库预检索结果】/.test(noPre), false);
+    assert.match(noPre, /意图判断：纯闲聊/);
+  });
+
+  // 普通对话模式（前端关掉 Agent）：这是旧实现最大的漏洞——知识库等于不存在
+  async function postChat(body, env) {
+    let captured = null;
+    const prev = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      captured = JSON.parse(init.body);
+      return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      });
+    };
+    try {
+      const res = await mod.routeRequest(new Request('https://example.com/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }), env, { waitUntil: () => {} });
+      assert.equal(res.status, 200);
+      return captured;
+    } finally {
+      globalThis.fetch = prev;
+    }
+  }
+
+  await checkAsync('普通对话模式（Agent 关闭）也会把知识库片段注入上游请求', async () => {
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '甲骨文云 ARM 免费额度怎么申请' }],
+      model: 'm1', agent: false,
+    }, webKbEnv);
+    assert.ok(captured, '应该真的发出了上游请求');
+    assert.equal(captured.messages[0].role, 'system');
+    assert.match(String(captured.messages[0].content), /【知识库预检索结果】/);
+    assert.match(String(captured.messages[0].content), /4 核 24G/);
+    assert.equal(captured.messages[1].role, 'user', '用户消息不能被顶掉');
+    assert.equal(captured.messages.length, 2);
+  });
+
+  await checkAsync('前端关掉「📚 知识库」后不再注入（kb_first=false）', async () => {
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '甲骨文云 ARM 免费额度怎么申请' }],
+      model: 'm1', agent: false, kb_first: false,
+    }, webKbEnv);
+    assert.equal(/【知识库预检索结果】/.test(JSON.stringify(captured.messages)), false);
+    assert.equal(captured.messages.length, 1);
+  });
+
+  await checkAsync('闲聊不触发预检索（"你好"不会带出一堆无关文档）', async () => {
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      model: 'm1', agent: false,
+    }, webKbEnv);
+    assert.equal(/【知识库预检索结果】/.test(JSON.stringify(captured.messages)), false);
+  });
+
+  await checkAsync('Agent 模式：预检索片段进系统提示词，并推送「正在优先检索知识库」进度', async () => {
+    const prev = globalThis.fetch;
+    let sysContent = '';
+    globalThis.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (body.messages && body.messages[0] && body.messages[0].role === 'system') {
+        sysContent = String(body.messages[0].content);
+      }
+      return sseFromEvents([deltaEvent({ content: '据知识库文档《甲骨文云 ARM 免费额度》，每月 4 核 24G。' })]);
+    };
+    const progresses = [];
+    try {
+      const r = await loopMod.tgAgentChat(
+        Object.assign({}, webKbEnv, { AGENT_MAX_STEPS: '2' }),
+        () => Promise.resolve({ ok: true }),
+        'web_prefetch_agent', 'm1',
+        [{ role: 'user', content: '甲骨文云 ARM 免费额度怎么申请' }],
+        true,
+        (t) => { progresses.push(t); return Promise.resolve(); },
+        { kbReadOnly: true, kbFirst: true, kbPrefetch: true, maxRuntimeMs: 30000 }
+      );
+      assert.match(sysContent, /【知识库预检索结果】/);
+      assert.match(sysContent, /4 核 24G/);
+      assert.equal(progresses.some(p => /正在优先检索知识库/.test(p)), true, '应推送预检索进度');
+      assert.match(r.text, /4 核 24G/);
+    } finally {
+      globalThis.fetch = prev;
+    }
+  });
+
+  await checkAsync('Web 页面：📚 知识库开关存在、默认开启、请求体带 kb_first', () => {
+    const html = uiMod.HTML_CONTENT;
+    assert.match(html, /id="kbToggle"/);
+    assert.match(html, /eochat_kb_first/);
+    assert.match(html, /kb_first: kbFirst/);
+    assert.match(html, /localStorage\.getItem\(KB_FIRST_KEY\)/);
+    assert.match(html, /kbFirst = kbRaw !== '0'/, '默认开启，只有显式存 0 才关闭');
+    // 文案拆成 图标 + 文字 两个 span：窄屏隐藏 .at-lbl 只留图标，避免把模型选择器挤出屏幕
+    assert.match(html, /id="kbToggle"[\s\S]{0,220}?<span class="at-ico">📚<\/span><span class="at-lbl">知识库<\/span>/);
+    assert.match(html, /querySelector\('\.at-lbl'\)/, '渲染函数要改 .at-lbl，不能整块覆盖 textContent');
+    assert.match(html, /@media \(max-width: 560px\)[\s\S]{0,200}\.at-lbl \{ display: none; \}/);
+  });
+
+  await checkAsync('知识库只读检索进 L1 缓存，save_doc 后立即失效（不会「刚存就查不到」）', async () => {
+    const env = { R2: blobBackend.makeBlobBackend(fakeBlobStore()) };
+    agentToolsMod.clearAgentToolCache();
+    await agentToolsMod.execAgentTool('save_doc',
+      { title: '缓存验证文档', content: '这里包含缓存验证关键词，用于测试命中。' }, env, 'tg_cache', false);
+
+    const q = { query: '缓存验证关键词' };
+    const r1 = await agentToolsMod.execAgentTool('search_docs', q, env, 'web_cache', false);
+    assert.match(r1, /缓存验证文档/);
+    const hits1 = agentToolsMod.getAgentToolCacheStats().hits;
+    const r2 = await agentToolsMod.execAgentTool('search_docs', q, env, 'web_cache', false);
+    const hits2 = agentToolsMod.getAgentToolCacheStats().hits;
+    assert.equal(r2, r1, '同参重复检索应返回同一份结果');
+    assert.ok(hits2 > hits1, '第二次同参调用应命中 L1 缓存');
+
+    // 写入新文档必须立刻让检索缓存失效，否则用户会以为「存了但搜不到」
+    await agentToolsMod.execAgentTool('save_doc',
+      { title: '第二篇缓存文档', content: '同样提到缓存验证关键词，但内容不同。' }, env, 'tg_cache', false);
+    const r3 = await agentToolsMod.execAgentTool('search_docs', q, env, 'web_cache', false);
+    assert.match(r3, /第二篇缓存文档/, '保存后必须立刻能搜到新文档');
+  });
+
   console.log('\n=== 结果 ===');
   console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
   if (fail > 0) process.exit(1);

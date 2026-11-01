@@ -727,6 +727,10 @@ export default `  <style>
     }
     .agent-toggle:hover { color: var(--text); border-color: var(--muted); }
     .agent-toggle.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    /* 知识库开关与 Agent 开关并排放在右侧，用一组容器包住，避免 space-between 把它们拉开 */
+    .toggle-group { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    /* 知识库开关开启时用品牌色描边（不用实心填充，免得和 Agent 的实心态抢视觉重心） */
+    .agent-toggle.kb-on { color: var(--brand-color); border-color: var(--brand-color); }
 
     .disclaimer {
       max-width: 820px;
@@ -864,6 +868,21 @@ export default `  <style>
 
       .msg-actions { opacity: 1; }
       .delete-btn { opacity: 1; }
+
+      /* 窄屏：模型名 + 两个开关挤一行，压缩内边距并给模型名让位 */
+      .input-bottom { gap: 6px; }
+      .toggle-group { gap: 4px; }
+      .input-bottom .agent-toggle { padding: 5px 9px; font-size: 12px; }
+      .model-display-text { max-width: 92px; }
+    }
+
+    /* 更窄的手机（≤560px）：两个开关只留图标。
+       实测 375px 视口下输入区可用宽约 317px，模型名 112 + 两个带文字的开关 182 = 294
+       已经贴边；只留图标后开关合计约 80px，模型名再长也不会把按钮挤出屏幕。 */
+    @media (max-width: 560px) {
+      .input-bottom .agent-toggle .at-lbl { display: none; }
+      .input-bottom .agent-toggle .at-ico { font-size: 15px; line-height: 1; }
+      .input-bottom .agent-toggle { padding: 6px 10px; }
     }
   </style>
 `;

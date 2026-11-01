@@ -230,7 +230,9 @@ export default `  // 会话本地存储：v7.0.1 起改用 eochat_sessions。
   function renderAgentToggle() {
     if (!agentToggle) return;
     agentToggle.classList.toggle('active', agentMode);
-    agentToggle.textContent = agentMode ? '🤖 Agent 开' : '🤖 Agent';
+    // 文案放在 .at-lbl 里而不是整块 textContent：窄屏会隐藏 .at-lbl 只留图标
+    var lbl = agentToggle.querySelector('.at-lbl');
+    if (lbl) lbl.textContent = agentMode ? 'Agent 开' : 'Agent';
     agentToggle.title = agentMode
       ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人。点击关闭。'
       : 'Agent 模式已关闭：普通对话，不调用工具。点击开启。';
@@ -242,6 +244,34 @@ export default `  // 会话本地存储：v7.0.1 起改用 eochat_sessions。
       renderAgentToggle();
     });
     renderAgentToggle();
+  }
+
+  // v7.7.0：Web 端「优先读取知识库」开关（默认开启）。
+  // 关闭后请求带 kb_first=false，服务端不做预检索；Agent 模式下仍可按需调用知识库工具。
+  // 与 Agent 开关相互独立：普通对话模式下这个开关才是知识库唯一的入口。
+  const kbToggle = document.getElementById('kbToggle');
+  const KB_FIRST_KEY = 'eochat_kb_first';
+  let kbFirst = true;
+  try {
+    var kbRaw = localStorage.getItem(KB_FIRST_KEY);
+    if (kbRaw !== null) kbFirst = kbRaw !== '0';
+  } catch (e) {}
+  function renderKbToggle() {
+    if (!kbToggle) return;
+    kbToggle.classList.toggle('kb-on', kbFirst);
+    var lbl = kbToggle.querySelector('.at-lbl');
+    if (lbl) lbl.textContent = kbFirst ? '知识库' : '关';
+    kbToggle.title = kbFirst
+      ? '已开启：每次提问前先检索知识库，命中就据此作答并注明出处。点击关闭。'
+      : '已关闭：不再检索知识库（Agent 模式下仍可按需调用知识库工具）。点击开启。';
+  }
+  if (kbToggle) {
+    kbToggle.addEventListener('click', () => {
+      kbFirst = !kbFirst;
+      try { localStorage.setItem(KB_FIRST_KEY, kbFirst ? '1' : '0'); } catch (e) {}
+      renderKbToggle();
+    });
+    renderKbToggle();
   }
 
 `;
