@@ -52,7 +52,8 @@ async function handleWebAgent(env, body) {
         // v7.7.0：进入循环前先做一次预检索，把最相关的正文片段直接放进提示词。
         // 只给标题列表时，模型经常「看了标题就凭训练知识答」，或先花一步 search_docs
         // 才摸到正文；预检索把这一步省掉，也让回答真正以知识库为准。
-        // 前端「📚 知识库」开关（body.kb_first=false）与 WEB_KB_FIRST=0 都可关掉它。
+        // v7.8.0：页面上的开关已移除，知识库恒定开启。kb_first=false 只为外部调用与
+        // 旧缓存页面保留；运维级关闭用 WEB_KB_FIRST=0。
         kbPrefetch: body.kb_first !== false && String(env.WEB_KB_FIRST || '1') !== '0',
         kbPrefetchBudgetMs: (() => {
           const v = parseInt(env.WEB_KB_PREFETCH_MS || '', 10);

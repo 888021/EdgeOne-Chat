@@ -2814,7 +2814,7 @@ async function main() {
     assert.equal(captured.messages.length, 2);
   });
 
-  await checkAsync('前端关掉「📚 知识库」后不再注入（kb_first=false）', async () => {
+  await checkAsync('外部调用显式传 kb_first=false 时不做预检索（页面已无开关，保留逃生口）', async () => {
     const captured = await postChat({
       messages: [{ role: 'user', content: '甲骨文云 ARM 免费额度怎么申请' }],
       model: 'm1', agent: false, kb_first: false,
@@ -2861,17 +2861,26 @@ async function main() {
     }
   });
 
-  await checkAsync('Web 页面：📚 知识库开关存在、默认开启、请求体带 kb_first', () => {
+  await checkAsync('Web 页面：知识库恒定开启，不再有「📚 知识库」开关', () => {
     const html = uiMod.HTML_CONTENT;
-    assert.match(html, /id="kbToggle"/);
-    assert.match(html, /eochat_kb_first/);
-    assert.match(html, /kb_first: kbFirst/);
-    assert.match(html, /localStorage\.getItem\(KB_FIRST_KEY\)/);
-    assert.match(html, /kbFirst = kbRaw !== '0'/, '默认开启，只有显式存 0 才关闭');
-    // 文案拆成 图标 + 文字 两个 span：窄屏隐藏 .at-lbl 只留图标，避免把模型选择器挤出屏幕
-    assert.match(html, /id="kbToggle"[\s\S]{0,220}?<span class="at-ico">📚<\/span><span class="at-lbl">知识库<\/span>/);
+    // 开关整体移除：按钮、偏好读写、请求字段都不该再出现，
+    // 任何一处残留都会让「默认开启」变成「看浏览器里存过什么」。
+    assert.equal(/id="kbToggle"/.test(html), false, '不应再有知识库开关按钮');
+    assert.equal(/kbFirst/.test(html), false, '不应再有前端开关状态变量');
+    assert.equal(/kb_first:/.test(html), false, '请求体不应再带开关字段（服务端默认即开启）');
+    assert.equal(/getItem\('eochat_kb_first'\)/.test(html), false, '不应再读取历史偏好');
+    // 但要把老用户浏览器里的「关闭状态」清掉，否则升级后仍在静默关库
+    assert.match(html, /localStorage\.removeItem\('eochat_kb_first'\)/);
+
+    // Agent 开关仍在，文案明确「开关与否都优先读知识库」
+    assert.match(html, /id="agentToggle"/);
+    assert.match(html, /无论开关与否，回答都会优先检索知识库文档/);
+    // 文案拆成 图标 + 文字 两个 span：窄屏隐藏 .at-lbl 只留图标
+    assert.match(html, /id="agentToggle"[\s\S]{0,260}?<span class="at-ico">🤖<\/span><span class="at-lbl">Agent<\/span>/);
     assert.match(html, /querySelector\('\.at-lbl'\)/, '渲染函数要改 .at-lbl，不能整块覆盖 textContent');
-    assert.match(html, /@media \(max-width: 560px\)[\s\S]{0,200}\.at-lbl \{ display: none; \}/);
+    assert.match(html, /@media \(max-width: 360px\)[\s\S]{0,200}\.at-lbl \{ display: none; \}/);
+    // 知识库开关的专属样式也应一并清掉（否则 CSS 里留着一个永远匹配不到的 .kb-on）
+    assert.equal(/\.kb-on/.test(html), false);
   });
 
   await checkAsync('知识库只读检索进 L1 缓存，save_doc 后立即失效（不会「刚存就查不到」）', async () => {

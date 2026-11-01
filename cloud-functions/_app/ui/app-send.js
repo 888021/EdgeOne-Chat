@@ -218,7 +218,6 @@ export default `  async function sendMessage() {
             messages: reqSession.messages.slice(-MAX_SEND_MSGS),
             model: modelSelect.value,
             agent: agentMode,
-            kb_first: kbFirst,
             session_id: reqSessionId
           }),
           signal: localAbortController.signal

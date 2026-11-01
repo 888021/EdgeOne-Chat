@@ -175,7 +175,9 @@ async function routeRequest(request, env, ctx) {
         // 旧实现只有 Agent 模式才加载知识库 —— 用户一关 Agent，知识库就等于不存在，
         // 回答完全靠模型训练知识。这里在调用上游之前先做一次轻量全文检索，
         // 命中就把片段作为一条 system 消息插到最前面（前端历史里不保存它，不会累积）。
-        // 关闭方式：前端「📚 知识库」开关（kb_first=false）或 WEB_KB_FIRST=0。
+        // v7.8.0：页面上不再有「📚 知识库」开关，知识库恒定开启（这正是用户要的默认行为）。
+        // 保留 kb_first=false 只是给外部调用方/旧缓存页面留的逃生口，页面本身已不再发送；
+        // 运维级关闭用 WEB_KB_FIRST=0。
         if (!isImageAPI && body.kb_first !== false && String(env.WEB_KB_FIRST || '1') !== '0') {
           try {
             const lastUserText = pickLastUserText(body.messages);
