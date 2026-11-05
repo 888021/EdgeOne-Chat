@@ -3455,6 +3455,134 @@ async function main() {
     }
   });
 
+  // ---------- v7.10.1 回归用例：这五条都是「曾经真的错」的地方，不是纸面假设 ----------
+
+  await checkAsync('空作用域不兜底成 default：拿不到 chatId 就宁可不记忆，也不串号', async () => {
+    assert.equal(memLayers.memScope(''), '');
+    assert.equal(memLayers.memScope(null), '');
+    assert.equal(memLayers.workKey(''), '', '空作用域不能生成 kb/work/.json 这种共享 key');
+    assert.equal(memLayers.epiKey(''), '');
+    assert.equal(await memLayers.appendWorkingTurn(memEnv, '', { user: '匿名 A 的私密问题', ai: '结论' }), false);
+    assert.equal(await memLayers.getWorking(memEnv, ''), null);
+    assert.deepEqual(await memLayers.getEpisodes(memEnv, ''), []);
+    assert.equal(await memLayers.appendEpisode(memEnv, '', { user: 'x', ai: 'y', topics: ['z'] }), false);
+    assert.deepEqual(await memLayers.forgetEpisodes(memEnv, '', 'x'), { removed: 0 });
+    assert.equal(await r2.storeGet(memEnv, 'kb/work/.json'), null, '绝不能真的写出共享文件');
+    // 有正常作用域时功能不受影响
+    assert.equal(await memLayers.appendWorkingTurn(memEnv, 'anon_ok', { user: '正常用户', ai: '结论' }), true);
+  });
+
+  check('时间统一按北京时间渲染：不会出现「当前时间 10:03 / 记忆里 02:03」的矛盾', () => {
+    const p = memLayers.memTimeParts(Date.UTC(2026, 0, 1, 0, 0, 0));
+    assert.equal(p.hh, '08', 'UTC 零点应是北京时间 08 点');
+    assert.equal(p.m, '01');
+    assert.equal(p.d, '01');
+    const p2 = memLayers.memTimeParts(Date.UTC(2026, 0, 1, 16, 30, 0));
+    assert.equal(p2.hh, '00', 'UTC 16:30 是北京时间次日 00:30');
+    assert.equal(p2.d, '02', '跨日要跟着时区走');
+  });
+
+  await checkAsync('L2 合并保留最新结论：不会「时间是最新的、内容是最旧的」', async () => {
+    const cid = 'mem_l2_merge_tail';
+    const base = Date.now();
+    for (let i = 1; i <= 5; i++) {
+      await memLayers.appendEpisode(memEnv, cid, {
+        ts: base + i * 1000,
+        user: '第' + i + '次讨论部署方案',
+        ai: '第' + i + '轮结论：先灰度再全量，回滚切上一个镜像。',
+        topics: ['部署方案'],
+      });
+    }
+    const eps = await memLayers.getEpisodes(memEnv, cid);
+    assert.equal(eps.length, 1, '同主题应合并成一条');
+    assert.match(eps[0].summary, /第5轮结论/, '合并后必须留下最新一轮的结论');
+    assert.match(eps[0].summary, /第1轮结论/, '也要保留最早那条的结论，不能只剩最新');
+    assert.ok(eps[0].summary.length <= 320, '合并后长度仍受控');
+  });
+
+  check('注入预算是硬上限：MEMORY_INJECT_CHARS 调到 400 也不会超', () => {
+    const work = {
+      turns: Array.from({ length: 5 }, (_, i) => ({
+        ts: Date.now(), user: '问题'.repeat(30) + i, ai: '结论'.repeat(30),
+      })),
+      topics: ['甲', '乙'], openTasks: ['待办一'], updatedAt: Date.now(),
+    };
+    const eps = Array.from({ length: 5 }, (_, i) => ({
+      ts: Date.now(), title: '标题' + i, summary: '摘要'.repeat(80),
+    }));
+    const r = memLayers.formatLayeredMemory({ work, episodes: eps }, { budget: 400 });
+    assert.ok(r.chars <= 400, '实际 ' + r.chars + ' 字符超过预算 400');
+    assert.ok(r.text.length > 0, '预算内仍应注入 L1');
+    // 预算太小时宁可不注入 L2，也不要塞半句话
+    const tiny = memLayers.formatLayeredMemory({ work, episodes: eps }, { budget: 120 });
+    assert.ok(tiny.chars <= 120, '小预算同样要守住');
+  });
+
+  await checkAsync('/memory 报的是真实条数：超过 30 条也不会把「共 35 条」说成「共 30 条」', async () => {
+    const cid = 'mem_report_count';
+    for (let i = 1; i <= 35; i++) {
+      await memMod.agentSaveMemory(memEnv, cid, '测试事实编号' + i + '：值' + i);
+    }
+    const rep = await memLayers.memoryReport(memEnv, cid);
+    assert.match(rep, /【L3 语义记忆】共 35 条/, '条数必须来自真实统计，不是检索上限');
+    assert.match(rep, /其余 5 条/, '「其余 N 条」也要按真实总数算');
+  });
+
+  await checkAsync('普通对话模式（Agent 关闭）也会写回记忆，不再只读不写', async () => {
+    const env = Object.assign({}, webKbEnv, { WEB_MEMORY: '1', WEB_KB_FIRST: '0' });
+    const prev = globalThis.fetch;
+    globalThis.fetch = async () => new Response(
+      'data: {"choices":[{"delta":{"content":"结论：把回源超时改成 30 秒，并加上两次重试。"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{"content":"这样可以避免边缘节点回源抖动直接打到用户。"}}]}\n\n'
+      + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    let res;
+    try {
+      res = await mod.routeRequest(new Request('https://example.com/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: '这个服务的回源超时应该设多少，顺便说下重试策略怎么配' }],
+          model: 'm1', agent: false, session_id: 'wsmem1', client_id: 'cmem1',
+        }),
+      }), env, { waitUntil: () => {} });
+    } finally {
+      globalThis.fetch = prev;
+    }
+    const streamed = await res.text();
+    assert.match(streamed, /回源超时改成 30 秒/, '客户端拿到的流内容不能被旁路改写');
+    assert.match(streamed, /边缘节点回源抖动/, '第二段也要原样透传');
+    // 写回在后台进行，给它一点时间（内存假存储，通常 < 10ms）
+    await new Promise(r => setTimeout(r, 300));
+    const work = await memLayers.getWorking(env, 'web_wsmem1');
+    assert.ok(work && work.turns.length === 1, 'L1 应写入会话作用域，实际 ' + (work ? work.turns.length : 'null'));
+    assert.match(work.turns[0].ai, /回源超时/, 'L1 里应存下结论');
+    const eps = await memLayers.getEpisodes(env, 'webu_cmem1');
+    assert.ok(eps.length >= 1, 'L2 应写入浏览器作用域');
+  });
+
+  await checkAsync('Web 无 session_id 也不兜底成 web_default：不会读到别的调用方的记忆', async () => {
+    const env = Object.assign({}, webKbEnv, { WEB_MEMORY: '1', WEB_KB_FIRST: '0' });
+    // 先往「兜底桶」里放一条别人的私密记忆
+    await memLayers.appendWorkingTurn(env, 'web_default', { user: '别人的私密问题：我家地址是哪里', ai: '别人的结论' });
+    await memMod.agentSaveMemory(env, 'web_default', '别人的私密事实：住址在某某路 1 号');
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '帮我看看这个部署方案有什么风险' }],
+      model: 'm1', agent: false,
+    }, env);
+    const all = JSON.stringify(captured.messages);
+    assert.equal(/别人的私密问题/.test(all), false, '不能读到 web_default 的工作记忆');
+    assert.equal(/某某路/.test(all), false, '不能读到 web_default 的长期记忆');
+  });
+
+  await checkAsync('L3 同样对空作用域短路：不读不写公共桶 kb/agent_mem_', async () => {
+    assert.deepEqual(await memMod.agentGetMemories(memEnv, ''), []);
+    assert.deepEqual(await memMod.agentSearchMemories(memEnv, '', '任意', 5), []);
+    assert.match(await memMod.agentSaveMemory(memEnv, '', '无主的事实'), /缺少用户标识/);
+    assert.deepEqual(await memMod.agentForgetMemory(memEnv, '', 'x'), { removed: 0 });
+    assert.equal(await memMod.agentTouchMemories(memEnv, '', ['x']), false);
+  });
+
   await checkAsync('/healthz 暴露 debug.memory（记忆是静默功能，必须有可观测数字）', async () => {
     const res = await mod.handle({ request: new Request('https://example.com/healthz'), env: { STORAGE_DEBUG: '1' }, waitUntil: () => {} });
     const j = await res.json();

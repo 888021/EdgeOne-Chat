@@ -188,8 +188,12 @@ function wxSafeId(id) {
 }
 
 // 为微信用户生成与 Telegram / Web 隔离的会话 ID（复用 tg-history / memory / mode / resume）
+// v7.10.1：userId 缺失时返回空串，不再兜底成 'wx_default'。
+// 兜底会让所有解析不出 userId 的消息共用一份历史与记忆——别人的对话会出现在你的上下文里。
+// 调用方拿到空串时按「无身份」处理：不读不写历史与记忆，只回这一条消息。
 function wxSessionChatId(userId) {
-  return 'wx_' + String(userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 56);
+  const u = String(userId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 56);
+  return u ? ('wx_' + u) : '';
 }
 
 function wxChannelVersion(env) {

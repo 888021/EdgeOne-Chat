@@ -12,8 +12,12 @@ import { agentLimits } from './agent/limits.js';
 // 进度通过 SSE 自定义事件推送：{"agent_progress": "..."} / {"agent_error": "..."}，
 // 正文走标准 OpenAI delta 事件，最后 data: [DONE] 结束。
 async function handleWebAgent(env, body) {
-  const sid = String(body.session_id || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
-  const webChatId = 'web_' + sid;
+  // v7.10.1：session_id 缺失时不再兜底成 'default'。兜底会让所有不传 session_id 的
+  // 调用方共用 web_default 这一份工作记忆，A 的对话要点会出现在 B 的提示词里。
+  // 现在没有 session_id 就退回浏览器作用域；连 client_id 也没有就干脆不读写记忆
+  // （没有身份就没有「谁的记忆」这回事）。
+  const rawSid = String(body.session_id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  const webChatId = rawSid ? 'web_' + rawSid : '';
   // v7.10.0 三层记忆的作用域：
   //   L1 工作记忆跟「这一个会话」走（web_<sid>）—— 换会话就该是新的一段现场；
   //   L2/L3 跟「这个浏览器」走（webu_<client_id>）—— 换会话不该把「我是谁、上次聊了什么」也换掉。
@@ -21,7 +25,9 @@ async function handleWebAgent(env, body) {
   // 记忆变成「只在本次会话内有效」，但绝不会串到别人身上。
   const cid = String(body.client_id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
   const longScope = cid ? ('webu_' + cid) : webChatId;
-  const memoryOn = String(env.WEB_MEMORY || '1') !== '0';
+  const memoryOn = String(env.WEB_MEMORY || '1') !== '0' && !!longScope;
+  // L1 的作用域：优先会话，没有会话标识时退回浏览器作用域（仍然唯一，不会串号）
+  const l1Scope = webChatId || longScope;
   const history = Array.isArray(body.messages) ? body.messages : [];
   const targetModelId = body.model;
   const encoder = new TextEncoder();
@@ -84,14 +90,14 @@ async function handleWebAgent(env, body) {
       };
       try {
         const onProgress = async (text) => { send({ agent_progress: String(text).slice(0, 500) }); };
-        let r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress, webOpts);
+        let r = await tgAgentChat(env, noOpTgApi, l1Scope, targetModelId, history, true, onProgress, webOpts);
         // v7.9.0：通道拒收 tools 时先降级为「文本调用模式」（工具仍能执行），
         // 再不行才彻底关工具 —— 旧实现一步跳到「没有工具」，用户拿到残废答案且毫不知情。
         if (r.fallback) {
-          r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress,
+          r = await tgAgentChat(env, noOpTgApi, l1Scope, targetModelId, history, true, onProgress,
             Object.assign({}, webOpts, { promptTools: true }));
         }
-        if (r.fallback) r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, false, onProgress, webOpts);
+        if (r.fallback) r = await tgAgentChat(env, noOpTgApi, l1Scope, targetModelId, history, false, onProgress, webOpts);
         if (r.error) {
           send({ agent_error: r.error });
         } else if (r.streamed) {

@@ -18,6 +18,12 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
+// 7.10.1：三层记忆收口 —— 修掉五处会真实出错的边界：①普通对话模式（关闭 Agent）只注入
+//        不写回，L1/L2 永远为空（现在用 tee 旁路写回，不改动发给客户端的字节）；
+//        ②记忆时间按 UTC 渲染而提示词声明「北京时间」，模型会照着错时间答；③L2 同主题
+//        合并时从头部截断，越合并越丢最新结论；④空作用域兜底成 default 导致匿名请求
+//        串号；⑤/memory 的 L3 条数被检索上限截断（有 200 条却报「共 60 条」）。
+//        另：注入预算改为硬上限、同用户并发写加锁、/memory 三层并行读。
 // 7.10.0：三层记忆 —— L1 工作记忆（会话要点/主题/未完成，kb/work/）、L2 情景记忆（每次实质对话
 //        一条摘要，可按关键词回溯，kb/epi/）、L3 语义记忆（用户稳定事实，带类型/标签/使用度与
 //        容量淘汰）。新增 recall_memory 工具与 /recall 命令；/memory 改为三层报告；/clear 只清
@@ -38,7 +44,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 7.5.0：Agent 精修 —— 时间预算治理（工具/上游超时随剩余预算收缩 + 收尾预留）、
 //        跨步重复调用熔断、无新信息检测、上下文二级压缩、reasoning_content 回传策略。
 // 7.4.0：同步新增微信 ClawBot（腾讯官方 iLink Bot API / openclaw-weixin 协议）通道支持 + 四重防盗绑安全锁。
-const APP_VERSION = '7.10.0';
+const APP_VERSION = '7.10.1';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

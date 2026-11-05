@@ -13,7 +13,7 @@
 import { mapSetBounded, mapGetBounded } from '../utils.js';
 import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
 import { agentMemKey, agentMemKeyLegacy, kbMemDir, kbNewMemFile, kbMemMarkdown,
-  kbBackfillMd, kbDeleteKeys } from '../store/kb.js';
+  kbBackfillMd, kbDeleteKeys, kbSafeChatId } from '../store/kb.js';
 
 // ==================== Telegram Agent：长期记忆 + 开关 ====================
 const tgAgentMemCache = new Map();
@@ -98,6 +98,10 @@ function evictMemories(arr, max) {
 }
 
 async function agentGetMemories(env, chatId) {
+  // v7.10.1：作用域为空时直接返回空，不去读 kb/agent_mem_ 这个「公共桶」。
+  // 与 memory-layers 的空作用域短路同一原则：拿不到用户标识就没有「谁的记忆」，
+  // 宁可读到空，也不能让不同请求读到同一份。
+  if (!kbSafeChatId(chatId)) return [];
   // v6.9.5：当绑定了 R2 时使用 60 秒 TTL 校验，防多 isolate 下长期脏读；
   // 未绑定 R2（纯内存退化模式）时不使内存缓存过期，避免纯内存模式下 60 秒后丢失记忆。
   const cached = mapGetBounded(tgAgentMemCache, chatId, env && env.R2 ? tgAgentMemExp : null);
@@ -170,6 +174,7 @@ async function agentGetMemories(env, chatId) {
 // opts: { kind, tags } —— 均可省略（旧调用方式完全兼容）
 async function agentSaveMemory(env, chatId, fact, opts) {
   opts = opts || {};
+  if (!kbSafeChatId(chatId)) return '缺少用户标识，未保存（记忆必须归属到某个具体用户）';
   const arr = await agentGetMemories(env, chatId);
   fact = String(fact || '').trim().slice(0, MEM_FACT_MAX_CHARS);
   if (!fact) return '内容为空，未保存';

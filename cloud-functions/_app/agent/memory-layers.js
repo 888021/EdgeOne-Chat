@@ -29,12 +29,22 @@ const EPI_PREFIX = 'kb/epi/';
 
 // 作用域清洗：chatId 可能来自 Telegram（数字）、微信（ilink id）或 Web（web_xxx / webu_xxx）。
 // 只保留字母数字下划线中划线，防止 ../ 之类的路径穿越污染 kb/ 目录。
+//
+// 空作用域返回空串，绝不兜底成 'default'：一旦兜底，所有拿不到 chatId 的请求
+// （外部调用、旧缓存页面、异常通道）会共用 kb/work/default.json，
+// 一个用户就能读到另一个用户的对话摘要。宁可「没有记忆」，也不能串号。
+// 下面每个读写函数都对空 scope 短路：读返回空、写返回 false。
 function memScope(chatId) {
-  const s = kbSafeChatId(chatId);
-  return s || 'default';
+  return kbSafeChatId(chatId) || '';
 }
-function workKey(chatId) { return WORK_PREFIX + memScope(chatId) + '.json'; }
-function epiKey(chatId) { return EPI_PREFIX + memScope(chatId) + '.json'; }
+function workKey(chatId) {
+  const s = memScope(chatId);
+  return s ? WORK_PREFIX + s + '.json' : '';
+}
+function epiKey(chatId) {
+  const s = memScope(chatId);
+  return s ? EPI_PREFIX + s + '.json' : '';
+}
 
 // ==================== 容量与预算 ====================
 // 全部可用环境变量覆盖，方便按部署规模调（也方便自检把上限压到很小来验证淘汰逻辑）。
@@ -215,10 +225,28 @@ function digestTurn(input) {
   };
 }
 
+// ==================== 写操作串行化 ====================
+// 记忆的写回是「读 → 改 → 写」，同一用户连发两条消息时两个写回会读到同一份旧数据，
+// 后写的把前一条整个覆盖掉——表现就是「刚说的话没进记忆」。
+// 这里在 isolate 内用一条 per-scope 的 Promise 链把写操作排成队；跨 isolate 仍有竞争，
+// 但那时丢的是「一条摘要」而不是「整轮对话」，且不影响任何回答。
+// 链尾完成后自动从 Map 删除，避免长驻 isolate 泄漏。
+const writeChains = new Map();
+function withWriteLock(scope, fn) {
+  if (!scope) return Promise.resolve(fn());
+  const prev = writeChains.get(scope) || Promise.resolve();
+  const next = prev.then(fn, fn);   // 前一个失败也要继续，否则一次抖动会卡死后续写入
+  const tail = next.then(() => {}, () => {});
+  writeChains.set(scope, tail);
+  tail.then(() => { if (writeChains.get(scope) === tail) writeChains.delete(scope); });
+  return next;
+}
+
 // ==================== L1 工作记忆 ====================
 const workCache = new Map();
 const workExp = new Map();
-const WORK_CACHE_TTL_MS = 60 * 1000;
+// 缓存 TTL 由 mapSetBounded 的默认值（60 秒）控制，见 utils.js。
+// 这里不再单独定义一份常量：定义了却不用，读代码的人会以为它能调。
 
 function emptyWork(scope) {
   const now = Date.now();
@@ -245,6 +273,7 @@ function normalizeWork(raw, scope) {
 async function getWorking(env, chatId, opts) {
   if (!layersEnabled(env) || !env || !env.R2) return null;
   const scope = memScope(chatId);
+  if (!scope) return null;
   const cached = mapGetBounded(workCache, scope, env.R2 ? workExp : null);
   if (cached) return JSON.parse(JSON.stringify(cached));
   let work = null;
@@ -265,6 +294,7 @@ async function getWorking(env, chatId, opts) {
 async function saveWorking(env, chatId, work) {
   if (!env || !env.R2) return false;
   const scope = memScope(chatId);
+  if (!scope) return false;
   work.updatedAt = Date.now();
   mapSetBounded(workCache, scope, JSON.parse(JSON.stringify(work)), undefined, workExp);
   const ok = await storePutChecked(env, workKey(scope), JSON.stringify(work));
@@ -274,46 +304,51 @@ async function saveWorking(env, chatId, work) {
 
 // 追加一轮到工作记忆：轮次超限从最旧丢弃，主题做加权合并（新主题优先），
 // openTasks 只保留最近 6 条且去重——它是「下次接着做」的清单，不是日志。
+// 整个「读-改-写」放在写锁里，避免同用户连发两条时后一条覆盖前一条。
 async function appendWorkingTurn(env, chatId, digest) {
   if (!layersEnabled(env) || !env || !env.R2) return false;
-  const lim = limitsOf(env);
   const scope = memScope(chatId);
-  let work = (await getWorking(env, scope)) || emptyWork(scope);
-  const entry = {
-    ts: digest.ts || Date.now(),
-    user: clipText(digest.user, Math.round(lim.workTurnChars * 0.5)),
-    ai: clipText(digest.ai, Math.round(lim.workTurnChars * 0.5)),
-    topics: (digest.topics || []).slice(0, 6),
-    tools: (digest.tools || []).slice(0, 6),
-    docs: (digest.docs || []).slice(0, 4),
-    pending: !!digest.pending,
-  };
-  work.turns.push(entry);
-  while (work.turns.length > lim.workTurns) work.turns.shift();
+  if (!scope) return false;
+  const lim = limitsOf(env);
+  return await withWriteLock(scope, async () => {
+    let work = (await getWorking(env, scope)) || emptyWork(scope);
+    const entry = {
+      ts: digest.ts || Date.now(),
+      user: clipText(digest.user, Math.round(lim.workTurnChars * 0.5)),
+      ai: clipText(digest.ai, Math.round(lim.workTurnChars * 0.5)),
+      topics: (digest.topics || []).slice(0, 6),
+      tools: (digest.tools || []).slice(0, 6),
+      docs: (digest.docs || []).slice(0, 4),
+      pending: !!digest.pending,
+    };
+    work.turns.push(entry);
+    while (work.turns.length > lim.workTurns) work.turns.shift();
 
-  // 主题：把本轮主题插到最前（越新越靠前），去重后截断
-  const merged = [];
-  for (const t of entry.topics.concat(work.topics)) {
-    if (t && merged.indexOf(t) === -1) merged.push(t);
-  }
-  work.topics = merged.slice(0, 10);
+    // 主题：把本轮主题插到最前（越新越靠前），去重后截断
+    const merged = [];
+    for (const t of entry.topics.concat(work.topics)) {
+      if (t && merged.indexOf(t) === -1) merged.push(t);
+    }
+    work.topics = merged.slice(0, 10);
 
-  // 未完成事项：本轮 pending 就记一条，否则把已完成的（同主题）清掉
-  const taskText = entry.pending ? clipText(entry.user, 80) : '';
-  const keptTasks = work.openTasks.filter(t => {
-    if (!taskText) return !entry.topics.some(tp => t.indexOf(tp) !== -1);
-    return t !== taskText;
+    // 未完成事项：本轮 pending 就记一条，否则把已完成的（同主题）清掉
+    const taskText = entry.pending ? clipText(entry.user, 80) : '';
+    const keptTasks = work.openTasks.filter(t => {
+      if (!taskText) return !entry.topics.some(tp => t.indexOf(tp) !== -1);
+      return t !== taskText;
+    });
+    if (taskText) keptTasks.unshift(taskText);
+    work.openTasks = keptTasks.slice(0, 6);
+
+    const ok = await saveWorking(env, scope, work);
+    if (ok) memCounters.workWrites++;
+    return ok;
   });
-  if (taskText) keptTasks.unshift(taskText);
-  work.openTasks = keptTasks.slice(0, 6);
-
-  const ok = await saveWorking(env, scope, work);
-  if (ok) memCounters.workWrites++;
-  return ok;
 }
 
 async function clearWorking(env, chatId) {
   const scope = memScope(chatId);
+  if (!scope) return true;
   workCache.delete(scope);
   workExp.delete(scope);
   if (!env || !env.R2) return true;
@@ -350,6 +385,7 @@ function normalizeEpisodes(raw, scope) {
 async function getEpisodes(env, chatId) {
   if (!layersEnabled(env) || !env || !env.R2) return [];
   const scope = memScope(chatId);
+  if (!scope) return [];
   const cached = mapGetBounded(epiCache, scope, env.R2 ? epiExp : null);
   if (cached) return cached.items.slice();
   let data = null;
@@ -365,6 +401,7 @@ async function getEpisodes(env, chatId) {
 async function saveEpisodes(env, chatId, items) {
   if (!env || !env.R2) return false;
   const scope = memScope(chatId);
+  if (!scope) return false;
   const lim = limitsOf(env);
   const cutoff = Date.now() - lim.epiTtlMs;
   // 先按时间淘汰过期条目，再按容量保留最近的 epiMax 条。
@@ -387,45 +424,63 @@ function topicOverlap(a, b) {
   return n / Math.min(a.length, b.length);
 }
 
+// 合并两条摘要：保留「首条结论」+「最新结论」，中间用省略号略过。
+// 旧实现是 clipText(旧 + '；' + 新, 320)，而 clipText 从头部截断——合并次数越多，
+// 最新的结论越容易被砍掉，最后变成「ts 是最新的、内容是第一次聊的」这种最坏错配：
+// 用户追问「刚才说的第三点」，模型翻到一条时间最新、内容却停在第一轮的记忆。
+function mergeSummary(oldS, newS, cap) {
+  const a = String(oldS || '');
+  const b = String(newS || '');
+  if (!b) return clipText(a, cap);
+  if (!a) return clipText(b, cap);
+  const budget = Math.max(80, cap - 4);          // 留出「；…；」的位置
+  const head = clipText(a, Math.max(40, Math.round(budget * 0.55)));
+  const tail = clipText(b, Math.max(40, budget - head.length - 3));
+  const out = head + '；…；' + tail;
+  return out.length <= cap ? out : head + '；…；' + clipText(b, Math.max(20, cap - head.length - 3));
+}
+
 // 追加一条情景记忆。20 分钟内的同主题对话合并成一条：
 // 「先问额度、再问怎么开、再问计费」本质是同一件事，拆成三条只会让回忆时读到三段碎片。
 async function appendEpisode(env, chatId, digest) {
   if (!layersEnabled(env) || !env || !env.R2) return false;
-  const lim = limitsOf(env);
   const scope = memScope(chatId);
-  const items = await getEpisodes(env, scope);
-  const now = digest.ts || Date.now();
-  const title = clipText(digest.user || digest.ai, 50);
-  const summary = clipText(digest.ai || digest.user, 320);
-  const last = items.length ? items[items.length - 1] : null;
-  let merged = false;
-  if (last && now - last.ts <= lim.epiMergeMs && topicOverlap(digest.topics || [], last.topics) >= 0.5) {
-    last.ts = now;
-    last.turns = (last.turns || 1) + 1;
-    last.summary = clipText(last.summary + '；' + summary, 320);
-    last.topics = [...new Set((last.topics || []).concat(digest.topics || []))].slice(0, 8);
-    last.tools = [...new Set((last.tools || []).concat(digest.tools || []))].slice(0, 6);
-    last.docs = [...new Set((last.docs || []).concat(digest.docs || []))].slice(0, 4);
-    merged = true;
-    memCounters.episodesMerged++;
-  } else {
-    items.push({
-      id: 'ep_' + now.toString(36) + '_' + Math.random().toString(36).slice(2, 6),
-      ts: now,
-      title: title,
-      summary: summary,
-      topics: (digest.topics || []).slice(0, 8),
-      tools: (digest.tools || []).slice(0, 6),
-      docs: (digest.docs || []).slice(0, 4),
-      turns: 1,
-    });
-    memCounters.episodesWritten++;
-  }
-  return await saveEpisodes(env, scope, items);
+  if (!scope) return false;
+  const lim = limitsOf(env);
+  return await withWriteLock(scope, async () => {
+    const items = await getEpisodes(env, scope);
+    const now = digest.ts || Date.now();
+    const title = clipText(digest.user || digest.ai, 50);
+    const summary = clipText(digest.ai || digest.user, 320);
+    const last = items.length ? items[items.length - 1] : null;
+    if (last && now - last.ts <= lim.epiMergeMs && topicOverlap(digest.topics || [], last.topics) >= 0.5) {
+      last.ts = now;
+      last.turns = (last.turns || 1) + 1;
+      last.summary = mergeSummary(last.summary, summary, 320);
+      last.topics = [...new Set((last.topics || []).concat(digest.topics || []))].slice(0, 8);
+      last.tools = [...new Set((last.tools || []).concat(digest.tools || []))].slice(0, 6);
+      last.docs = [...new Set((last.docs || []).concat(digest.docs || []))].slice(0, 4);
+      memCounters.episodesMerged++;
+    } else {
+      items.push({
+        id: 'ep_' + now.toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+        ts: now,
+        title: title,
+        summary: summary,
+        topics: (digest.topics || []).slice(0, 8),
+        tools: (digest.tools || []).slice(0, 6),
+        docs: (digest.docs || []).slice(0, 4),
+        turns: 1,
+      });
+      memCounters.episodesWritten++;
+    }
+    return await saveEpisodes(env, scope, items);
+  });
 }
 
 async function clearEpisodes(env, chatId) {
   const scope = memScope(chatId);
+  if (!scope) return true;
   epiCache.delete(scope);
   epiExp.delete(scope);
   if (!env || !env.R2) return true;
@@ -437,13 +492,19 @@ async function forgetEpisodes(env, chatId, keyword) {
   const kw = String(keyword || '').trim();
   if (!kw) return { removed: 0 };
   const scope = memScope(chatId);
-  const items = await getEpisodes(env, scope);
-  const kept = items.filter(e => {
-    const hay = (e.title + ' ' + e.summary + ' ' + (e.topics || []).join(' ')).toLowerCase();
-    return hay.indexOf(kw.toLowerCase()) === -1;
+  if (!scope) return { removed: 0 };
+  const kwLower = kw.toLowerCase();
+  // 读-改-写整段都在锁里：否则「读完之后、加锁之前」新写入的一条会被这次删除覆盖掉。
+  const removed = await withWriteLock(scope, async () => {
+    const items = await getEpisodes(env, scope);
+    const kept = items.filter(e => {
+      const hay = (e.title + ' ' + e.summary + ' ' + (e.topics || []).join(' ')).toLowerCase();
+      return hay.indexOf(kwLower) === -1;
+    });
+    const n = items.length - kept.length;
+    if (n > 0) await saveEpisodes(env, scope, kept);
+    return n;
   });
-  const removed = items.length - kept.length;
-  if (removed > 0) await saveEpisodes(env, scope, kept);
   return { removed: removed };
 }
 
@@ -490,16 +551,18 @@ function queryTokens(q) {
 
 // 注入用：从情景记忆里挑出与本次提问最相关的几条。
 // 与 recallMemory 的区别是「静默」——没有相关条目时返回空数组，不做任何 I/O。
-// 阈值刻意压低（>=2.5）：注入阶段宁可多给一条沾边的历史，也不要让模型完全看不到。
+// 没有查询词就没有「相关」可言：返回空，而不是把最近几条贴上
+// 「与本次提问相关的过往对话」的标签塞给模型——那等于让模型把无关历史当上下文用。
 function pickRelevantEpisodes(episodes, query, limit) {
   const list = Array.isArray(episodes) ? episodes : [];
   if (!list.length) return [];
   const q = String(query || '').trim();
+  if (!q) return [];
   const qLower = q.toLowerCase();
   const qTokens = queryTokens(q);
   const now = Date.now();
-  const scored = list.map(e => ({ e: e, s: q ? scoreEpisode(e, qLower, qTokens, now) : 4 / (1 + daysBetween(now, e.ts) / 30) }));
-  const picked = q ? scored.filter(x => episodeHits(x.e, qLower, qTokens)) : scored;
+  const scored = list.map(e => ({ e: e, s: scoreEpisode(e, qLower, qTokens, now) }));
+  const picked = scored.filter(x => episodeHits(x.e, qLower, qTokens));
   picked.sort((a, b) => b.s - a.s);
   return picked.slice(0, limit > 0 ? limit : 3).map(x => x.e);
 }
@@ -577,19 +640,60 @@ function formatRecallResult(r) {
     + '与当前说法冲突时以用户此刻的说法为准，并说明「之前记的是…」）';
 }
 
-function fmtDate(ts) {
+// ==================== 时间渲染 ====================
+// 记忆里的时间一律按北京时间渲染。EdgeOne 边缘节点跑在 UTC，若直接用 getHours()，
+// 提示词里会同时出现「当前时间：10:03（北京时间）」和「L1 最近更新 02:03」，
+// 模型看到两个矛盾的时间，很可能照着后者回答「现在是凌晨两点」——直接把错误时间
+// 交给用户。Intl 的 timeZone 是唯一可靠做法（手算 +8 在夏令时/自定义时区下会错）。
+const MEM_TZ = 'Asia/Shanghai';
+const MEM_TZ_FALLBACK_MS = 8 * 3600 * 1000;
+
+// 格式化器只建一次：Intl.DateTimeFormat 的构造比 format 贵得多（实测约 0.16ms/次），
+// 而一轮提示词要渲染 4~6 个时间戳。这里缓存失败结果，避免缺少完整 ICU 时反复抛异常。
+let memFmt;
+let memFmtReady = false;
+function memFormatter() {
+  if (memFmtReady) return memFmt;
+  memFmtReady = true;
   try {
-    const d = new Date(ts);
-    const p = n => String(n).padStart(2, '0');
-    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
-  } catch (e) { return ''; }
+    memFmt = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: MEM_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+  } catch (e) {
+    memFmt = null;
+  }
+  return memFmt;
+}
+
+function memTimeParts(ts) {
+  const t = (typeof ts === 'number' && ts > 0) ? ts : Date.now();
+  const fmt = memFormatter();
+  if (fmt) {
+    try {
+      const o = {};
+      for (const p of fmt.formatToParts(new Date(t))) o[p.type] = p.value;
+      // hour12:false 在部分实现里会把午夜给成 24
+      if (o.hour === '24') o.hour = '00';
+      if (o.year && o.month && o.day && o.hour && o.minute) {
+        return { y: o.year, m: o.month, d: o.day, hh: o.hour, mm: o.minute };
+      }
+    } catch (e) { /* 落到下面的手算兜底 */ }
+  }
+  const d = new Date(t + MEM_TZ_FALLBACK_MS);
+  const p = n => String(n).padStart(2, '0');
+  return {
+    y: String(d.getUTCFullYear()), m: p(d.getUTCMonth() + 1), d: p(d.getUTCDate()),
+    hh: p(d.getUTCHours()), mm: p(d.getUTCMinutes()),
+  };
+}
+function fmtDate(ts) {
+  const p = memTimeParts(ts);
+  return p.y + '-' + p.m + '-' + p.d;
 }
 function fmtClock(ts) {
-  try {
-    const d = new Date(ts);
-    const p = n => String(n).padStart(2, '0');
-    return p(d.getHours()) + ':' + p(d.getMinutes());
-  } catch (e) { return ''; }
+  const p = memTimeParts(ts);
+  return p.hh + ':' + p.mm;
 }
 function memKindLabel(kind) {
   switch (String(kind || 'fact')) {
@@ -639,14 +743,17 @@ function formatEpisodesBlock(episodes, budget) {
 }
 
 // 组装 L1 + L2 两块文本（L3 由 prompt.js 单独按相关性注入，逻辑保持不变）。
+// 预算必须是硬上限：旧写法 epiBudget = Math.max(300, total - workText.length) 在
+// total 被调到 400 时会给出 180 + 300 = 480，比预算还多——「限制」变成了「建议」。
+// 现在剩余额度不足 120 字符就干脆不注入 L2（半句话的历史比没有历史更容易误导）。
 function formatLayeredMemory(layered, opts) {
   opts = opts || {};
   if (!layered) return { text: '', chars: 0 };
   const total = opts.budget > 0 ? opts.budget : DEFAULTS.injectChars;
   const workBudget = Math.round(total * 0.45);
   const workText = formatWorkingBlock(layered.work, workBudget);
-  const epiBudget = Math.max(300, total - workText.length);
-  const epiText = formatEpisodesBlock(layered.episodes, epiBudget);
+  const epiBudget = total - workText.length - 2;   // 2 = 中间那个 '\n\n'
+  const epiText = epiBudget >= 120 ? formatEpisodesBlock(layered.episodes, epiBudget) : '';
   const parts = [workText, epiText].filter(Boolean);
   const text = parts.join('\n\n');
   return { text: text, chars: text.length };
@@ -681,12 +788,15 @@ async function recordTurnMemory(env, chatId, turn, opts) {
 }
 
 // ==================== 命令与统计 ====================
+// 三层并行读：/memory 和 /status 都是交互命令，串行三次 R2 往返纯属白等。
 async function memoryStats(env, chatId) {
   const empty = { workTurns: 0, workTopics: [], openTasks: 0, episodes: 0, semantic: 0, chars: 0 };
   try {
-    const work = layersEnabled(env) ? await getWorking(env, chatId) : null;
-    const episodes = layersEnabled(env) ? await getEpisodes(env, chatId) : [];
-    const sem = await agentMemStats(env, chatId);
+    const [work, episodes, sem] = await Promise.all([
+      layersEnabled(env) ? getWorking(env, chatId).catch(() => null) : Promise.resolve(null),
+      layersEnabled(env) ? getEpisodes(env, chatId).catch(() => []) : Promise.resolve([]),
+      agentMemStats(env, chatId).catch(() => ({ count: 0, chars: 0 })),
+    ]);
     return {
       workTurns: work && work.turns ? work.turns.length : 0,
       workTopics: work && work.topics ? work.topics.slice(0, 6) : [],
@@ -702,9 +812,15 @@ async function memoryStats(env, chatId) {
 async function memoryReport(env, chatId, opts) {
   opts = opts || {};
   const showItems = opts.showItems !== false;
-  const work = layersEnabled(env) ? await getWorking(env, chatId) : null;
-  const episodes = layersEnabled(env) ? await getEpisodes(env, chatId) : [];
-  const sem = await agentSearchMemories(env, chatId, '', 60);
+  const [work, episodes, semAll, semStat] = await Promise.all([
+    layersEnabled(env) ? getWorking(env, chatId).catch(() => null) : Promise.resolve(null),
+    layersEnabled(env) ? getEpisodes(env, chatId).catch(() => []) : Promise.resolve([]),
+    // 列表只要前 30 条；条数必须另外取，否则「共 60 条」会把 400 条的上限说成 60 条。
+    agentSearchMemories(env, chatId, '', 30).catch(() => []),
+    agentMemStats(env, chatId).catch(() => ({ count: 0, chars: 0, max: 0 })),
+  ]);
+  const sem = semAll;
+  const semTotal = Math.max(semStat.count || 0, sem.length);
 
   const lines = ['🧠 三层记忆', '────────────'];
   // L1
@@ -724,16 +840,19 @@ async function memoryReport(env, chatId, opts) {
   if (showItems && episodes.length) {
     for (const e of episodes.slice(-3).reverse()) lines.push('  · ' + fmtDate(e.ts) + '《' + e.title + '》');
   }
-  // L3
-  lines.push('【L3 语义记忆】共 ' + sem.length + ' 条');
+  // L3：条数用真实总数（semTotal），列表只用前 30 条。
+  // 旧写法直接用检索结果的长度当「共 N 条」，而检索本身有 limit，
+  // 于是有 200 条记忆的用户会看到「共 60 条」——报数错得比没报还糟。
+  lines.push('【L3 语义记忆】共 ' + semTotal + ' 条'
+    + (semStat.max > 0 ? '（上限 ' + semStat.max + '）' : ''));
   if (showItems && sem.length) {
-    for (let i = 0; i < Math.min(sem.length, 30); i++) {
+    for (let i = 0; i < sem.length; i++) {
       lines.push('  ' + (i + 1) + '. ' + sem[i].fact);
     }
-    if (sem.length > 30) lines.push('  …（其余 ' + (sem.length - 30) + ' 条可用 /recall 关键词 检索）');
+    if (semTotal > sem.length) lines.push('  …（其余 ' + (semTotal - sem.length) + ' 条可用 /recall 关键词 检索）');
   }
   if (!work || !work.turns.length) {
-    if (!episodes.length && !sem.length) {
+    if (!episodes.length && !semTotal) {
       lines.push('');
       lines.push('💡 暂无记忆。对我说「记住 xxx」保存长期事实；聊过几轮后会自动生成工作记忆与情景记忆。');
     }
@@ -754,6 +873,8 @@ export {
   extractTopics,
   firstConclusion,
   digestTurn,
+  mergeSummary,
+  memTimeParts,
   shouldRecordEpisode,
   getWorking,
   appendWorkingTurn,

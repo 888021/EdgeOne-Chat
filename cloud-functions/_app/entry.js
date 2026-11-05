@@ -29,7 +29,82 @@ import { resolveStore, ensureProvisioned, activeBackendName, storageDiagnostics,
 import { loadStoredImage, buildImageSseResponse, IMG_URL_PATH } from './images.js';
 import { kbPrefetch } from './kb/prefetch.js';
 import { agentGetMemories, formatSemanticBlock } from './agent/memory.js';
-import { getWorking, getEpisodes, pickRelevantEpisodes, formatLayeredMemory, memoryDiag } from './agent/memory-layers.js';
+import { getWorking, getEpisodes, pickRelevantEpisodes, formatLayeredMemory, memoryDiag,
+  recordTurnMemory } from './agent/memory-layers.js';
+
+// ==================== 普通对话模式的记忆写回 ====================
+// v7.10.1：旧实现只在这里「注入」记忆，却从不「写回」——于是 L1/L2 永远是空的，
+// 注入的那段代码等于白写，用户关掉 Agent 后聊一整天，`/memory` 里还是一片空白。
+// 这里用 tee() 把上游 SSE 分出一支旁路，边读边抽取正文，流结束后写回。
+// 三点约束：
+//   1) 只旁路、不改写：客户端拿到的字节与原来完全一致；
+//   2) 不阻塞：不 await，写回失败/超时都不影响已经发出去的答案；
+//   3) 只收正文：上限 6000 字符，足够抽出结论句，也不会为一段长回答占满内存。
+const MEM_MIRROR_MAX_CHARS = 6000;
+
+async function collectSseAssistantText(stream) {
+  const reader = stream.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line || line.charAt(0) === ':') continue;
+        if (line.indexOf('data:') !== 0) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const j = JSON.parse(data);
+          const ch = j && j.choices && j.choices[0];
+          const d = ch && (ch.delta || ch.message);
+          if (d && typeof d.content === 'string') text += d.content;
+        } catch (e) { /* 非 JSON 的心跳/注释行，忽略 */ }
+      }
+      if (text.length >= MEM_MIRROR_MAX_CHARS) {
+        text = text.slice(0, MEM_MIRROR_MAX_CHARS);
+        break;
+      }
+    }
+  } catch (e) {
+    // 上游中途断开：已经收到的部分照样写回（半截结论也比没有强）
+  }
+  try { await reader.cancel(); } catch (e) {}
+  return text;
+}
+
+// 旁路写回：调用方拿到响应后这里继续跑，不 await。
+function mirrorTurnToMemory(env, upstreamBody, meta) {
+  if (!upstreamBody || typeof upstreamBody.tee !== 'function') return upstreamBody;
+  let client = null;
+  let mirror = null;
+  try {
+    [client, mirror] = upstreamBody.tee();
+  } catch (e) {
+    return upstreamBody;
+  }
+  const job = (async () => {
+    const ai = await collectSseAssistantText(mirror);
+    if (!ai) return;
+    const timeout = new Promise(r => setTimeout(() => r({ ok: false, reason: 'timeout' }), 800));
+    await Promise.race([
+      recordTurnMemory(env, meta.sessionScope, {
+        userText: meta.userText,
+        assistantText: ai,
+      }, { episodeScope: meta.longScope }).catch(() => null),
+      timeout,
+    ]);
+  })();
+  // 显式吞掉异常：记忆是增强项，绝不能冒泡成未处理的 Promise 拒绝
+  job.catch(() => {});
+  return client;
+}
 
 // 取最后一条用户消息的纯文本（兼容多模态分片数组）。预检索用它当查询词。
 function pickLastUserText(messages) {
@@ -188,16 +263,22 @@ async function routeRequest(request, env, ctx) {
         // 合成一段 system 前缀（≤1500 字符），和知识库片段一起下发。
         const injectParts = [];
         const lastUserText = pickLastUserText(body.messages);
-        const webSid = String(body.session_id || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
+        // v7.10.1：session_id 缺失时不再兜底成 'web_default'。
+        // 兜底的后果是所有不带 session_id 的请求共用一份 L1 工作记忆——
+        // 外部调用方 A 的对话要点会出现在调用方 B 的提示词里。
+        // 现在没有会话标识就退回浏览器作用域（有 client_id）或干脆不读写 L1。
+        const rawSid = String(body.session_id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
         const webCid = String(body.client_id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+        // L1 跟会话走、L2/L3 跟浏览器走（与 web-agent.js 同一套作用域规则）
+        const longScope = webCid ? ('webu_' + webCid) : (rawSid ? 'web_' + rawSid : '');
+        const sessionScope = rawSid ? ('web_' + rawSid) : longScope;
+        const memoryOn = !isImageAPI && String(env.WEB_MEMORY || '1') !== '0' && !!longScope;
 
-        if (!isImageAPI && String(env.WEB_MEMORY || '1') !== '0') {
+        if (memoryOn) {
           try {
-            // L1 跟会话走、L2/L3 跟浏览器走（与 web-agent.js 同一套作用域规则）
-            const longScope = webCid ? ('webu_' + webCid) : ('web_' + webSid);
             const [mems, work, eps] = await Promise.all([
               agentGetMemories(env, longScope).catch(() => []),
-              getWorking(env, 'web_' + webSid).catch(() => null),
+              sessionScope ? getWorking(env, sessionScope).catch(() => null) : Promise.resolve(null),
               getEpisodes(env, longScope).catch(() => []),
             ]);
             const memText = formatSemanticBlock(mems, lastUserText, 900);
@@ -252,7 +333,16 @@ async function routeRequest(request, env, ctx) {
         }
 
         if (!isImageAPI) {
-          return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
+          // v7.10.1：普通对话模式也写回记忆。旁路 tee 不改变发给客户端的字节，
+          // 写回在后台进行，失败/超时都不影响这一轮回答。
+          const outBody = memoryOn
+            ? mirrorTurnToMemory(env, upstreamResponse.body, {
+              userText: lastUserText,
+              sessionScope: sessionScope,
+              longScope: longScope,
+            })
+            : upstreamResponse.body;
+          return new Response(outBody, { headers: SSE_HEADERS });
         } else {
           return await buildImageSseResponse(env, upstreamResponse);
         }
