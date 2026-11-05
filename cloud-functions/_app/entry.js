@@ -28,6 +28,8 @@ import { HTML_CONTENT } from './ui/index.js';
 import { resolveStore, ensureProvisioned, activeBackendName, storageDiagnostics, probeStore } from './store/edge-store.js';
 import { loadStoredImage, buildImageSseResponse, IMG_URL_PATH } from './images.js';
 import { kbPrefetch } from './kb/prefetch.js';
+import { agentGetMemories, formatSemanticBlock } from './agent/memory.js';
+import { getWorking, getEpisodes, pickRelevantEpisodes, formatLayeredMemory, memoryDiag } from './agent/memory-layers.js';
 
 // 取最后一条用户消息的纯文本（兼容多模态分片数组）。预检索用它当查询词。
 function pickLastUserText(messages) {
@@ -123,6 +125,9 @@ async function routeRequest(request, env, ctx) {
         // v7.5.0：Agent 每轮统计（步数 / 工具数 / 失败数 / 缓存命中 / 停止原因）。
         // 只反映「处理这个请求的实例」，跨实例看全量请用控制台日志。
         try { debug.agent = agentTurnStats(); } catch (e) {}
+        // v7.10.0：三层记忆的实例内计数（写回次数 / 召回次数 / 写失败）。
+        // 记忆是「悄悄生效」的功能，没有这几个数就完全没法判断它到底有没有在工作。
+        try { debug.memory = memoryDiag(); } catch (e) {}
         payload.debug = debug;
       }
       return new Response(JSON.stringify(payload), { headers: HEALTH_HEADERS });
@@ -178,26 +183,57 @@ async function routeRequest(request, env, ctx) {
         // v7.8.0：页面上不再有「📚 知识库」开关，知识库恒定开启（这正是用户要的默认行为）。
         // 保留 kb_first=false 只是给外部调用方/旧缓存页面留的逃生口，页面本身已不再发送；
         // 运维级关闭用 WEB_KB_FIRST=0。
+        // v7.10.0：同一个位置再注入三层记忆。旧实现普通对话模式完全不带记忆，
+        // 用户一说「刚才说的那个」就断片；现在把 L1 要点 / L2 相关历史 / L3 长期事实
+        // 合成一段 system 前缀（≤1500 字符），和知识库片段一起下发。
+        const injectParts = [];
+        const lastUserText = pickLastUserText(body.messages);
+        const webSid = String(body.session_id || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
+        const webCid = String(body.client_id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+
+        if (!isImageAPI && String(env.WEB_MEMORY || '1') !== '0') {
+          try {
+            // L1 跟会话走、L2/L3 跟浏览器走（与 web-agent.js 同一套作用域规则）
+            const longScope = webCid ? ('webu_' + webCid) : ('web_' + webSid);
+            const [mems, work, eps] = await Promise.all([
+              agentGetMemories(env, longScope).catch(() => []),
+              getWorking(env, 'web_' + webSid).catch(() => null),
+              getEpisodes(env, longScope).catch(() => []),
+            ]);
+            const memText = formatSemanticBlock(mems, lastUserText, 900);
+            const layered = formatLayeredMemory({
+              work: work,
+              episodes: pickRelevantEpisodes(eps, lastUserText, 2),
+            }, { budget: 700 }).text;
+            const merged = [layered, memText].filter(Boolean).join('\n\n');
+            if (merged) injectParts.push(merged);
+          } catch (e) {
+            // 记忆注入失败不影响正常对话
+          }
+        }
+
         if (!isImageAPI && body.kb_first !== false && String(env.WEB_KB_FIRST || '1') !== '0') {
           try {
-            const lastUserText = pickLastUserText(body.messages);
             const pre = await kbPrefetch(env, lastUserText, {
               budgetMs: parseInt(env.WEB_KB_PREFETCH_MS || '', 10) > 0
                 ? Math.min(parseInt(env.WEB_KB_PREFETCH_MS, 10), 6000)
                 : 2200,
               topN: 2,
             });
-            if (pre && pre.ok && pre.text) {
-              const first = payload.messages[0];
-              if (first && first.role === 'system') {
-                // 前端自带 system 时合并，避免出现两条 system（部分上游会整单 400）
-                payload.messages[0] = { role: 'system', content: String(first.content || '') + '\n\n' + pre.text };
-              } else {
-                payload.messages = [{ role: 'system', content: pre.text }].concat(payload.messages);
-              }
-            }
+            if (pre && pre.ok && pre.text) injectParts.push(pre.text);
           } catch (e) {
             // 预检索失败绝不能影响正常对话：静默降级为「不带知识库回答」
+          }
+        }
+
+        if (injectParts.length) {
+          const injected = injectParts.join('\n\n');
+          const first = payload.messages[0];
+          if (first && first.role === 'system') {
+            // 前端自带 system 时合并，避免出现两条 system（部分上游会整单 400）
+            payload.messages[0] = { role: 'system', content: String(first.content || '') + '\n\n' + injected };
+          } else {
+            payload.messages = [{ role: 'system', content: injected }].concat(payload.messages);
           }
         }
 
