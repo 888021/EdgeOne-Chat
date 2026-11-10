@@ -15,6 +15,7 @@ import { denyUnauthorized } from './auth.js';
 import { hitRateLimit } from './rate-limit.js';
 import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders, keyPoolStatus } from './channel.js';
 import { readErrorBody } from './agent/stability.js';
+import { buildAccuracyHint } from './agent/accuracy.js';
 import { handleWebAgent } from './web-agent.js';
 import { agentTurnStats } from './agent/loop.js';
 import { handleTgWebhook } from './telegram/handler.js';
@@ -293,12 +294,23 @@ async function routeRequest(request, env, ctx) {
           }
         }
 
+        // v7.10.2：普通聊天（Agent 关闭）没有工具可用，算式只能靠模型心算，
+        // 是最容易给出错误近似值的场景。把确定性预计算结果与诚实要求一并注入 system。
+        if (!isImageAPI && String((env && env.AGENT_ACCURACY_HINT) || '1') !== '0') {
+          try {
+            const hint = buildAccuracyHint(lastUserText, { toolsAvailable: false });
+            if (hint) injectParts.push(hint.trim());
+          } catch (e) {
+            // 准确率提示是增强项，构造失败绝不能影响正常对话
+          }
+        }
+
         if (!isImageAPI && body.kb_first !== false && String(env.WEB_KB_FIRST || '1') !== '0') {
           try {
             const pre = await kbPrefetch(env, lastUserText, {
               budgetMs: parseInt(env.WEB_KB_PREFETCH_MS || '', 10) > 0
                 ? Math.min(parseInt(env.WEB_KB_PREFETCH_MS, 10), 6000)
-                : 2200,
+                : 2500,
               topN: 2,
             });
             if (pre && pre.ok && pre.text) injectParts.push(pre.text);

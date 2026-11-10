@@ -167,6 +167,8 @@ API_CONFIG = [{"url":"https://api.deepseek.com/v1/chat/completions",
 | `WX_ALLOWED_USERS` | 允许对话的微信用户 `ilink_user_id` 白名单，英文逗号分隔（不填则自动锁定为扫码绑定人本人，外人无法触发对话） |
 | `WX_WEBHOOK_SECRET` | 当使用第三方 iLink 网关推送至 `/wx-webhook` 时的校验密钥 |
 | `WX_POLL_BUDGET_MS` | 单次 `/api/wx/poll` 长轮询最大运行毫秒数，默认 `25000`（EdgeOne 函数支持最高 120s，可设为 `55000`~`85000`） |
+| `WX_RELAY_MAX_HOPS` | `120` | 自接力守护链最多连续接力多少棒（约 50 分钟），到点自然停链，之后由任意真实请求或外部监控 ping 重新唤醒。设 `0` 恢复无限接力（**会持续产生函数调用费用，谨慎**）。详见[已知限制 17](#六已知限制与取舍) |
+| `WX_RELAY_MIN_INTERVAL_MS` | `2000` | 两棒自接力之间的最小间隔，防止异常情况下形成紧密自请求风暴；另有每实例 600 次的硬上限（不可配） |
 | `WX_WEBHOOK_BUDGET_MS` | 微信单轮 Agent 运行预算，默认 `55000`（超时自动存档至 Blob，微信发「继续」即可续做） |
 | `WX_CHANNEL_VERSION` | 模拟 `@tencent-weixin/openclaw-weixin` 协议版本号，默认 `2.4.10`（自动编码 `iLink-App-ClientVersion: 132106`） |
 
@@ -241,7 +243,9 @@ MODEL_1   = sensenova-u1.5-fast:日日新 U1.5 Fast
 | `AGENT_MAX_STEPS` | `6` | 单轮最大工具调用步数（上限 12） |
 | `AGENT_TOOL_CONCURRENCY` | `4` | 同一批并行工具调用的并发上限（1~8） |
 | `AGENT_CONTEXT_BUDGET` | `28000` | 消息部分的上下文预算，**按字符计**；不含每步都要发的工具定义（约 7.5k）。超预算**先折叠**最长的工具结果，仍超才删最旧的整轮（v7.9.0 调换了两者顺序） |
-| `TEMPERATURE` | `0.7` | 采样温度。之前完全不传，等于把工具调用的稳定性交给上游默认值（不少通道默认 1.0，表现为参数漏字段、爱在 tool_calls 前后写解释）。推理模型（`*reasoner*` / `*r1*` / `o1` / `o3`）自动跳过不传 |
+| `TEMPERATURE` | `0.7` | 采样温度。之前完全不传，等于把工具调用的稳定性交给上游默认值（不少通道默认 1.0，表现为参数漏字段、爱在 tool_calls 前后写解释）。推理模型（`*reasoner*` / `*r1*` / `o1` / `o3`）自动跳过不传。**显式设置时优先于 `AGENT_TEMPERATURE`** |
+| `AGENT_TEMPERATURE` | `0.3` | 仅对**带 tools 的 Agent 请求**生效的采样温度。工具选择是结构化决策，低温能明显减少参数漏字段、同一问题换工具、在 `tool_calls` 外包一段解释。设 `0.7` 回到 v7.9.0 行为；普通聊天恒为 `0.7` |
+| `AGENT_ACCURACY_HINT` | `1` | 准确率增强总开关（设 `0` 关闭，便于 A/B 对比）：进入模型前用本地计算器把算式精确算好注入，并按本次提问生成一轮性的「时效必查 / 稳定常识直答 / 内部信息不编造」约束；Agent 与普通对话都生效；实现见 `agent/accuracy.js` 与第五节版本演进第 24 行 |
 | `AGENT_TOOL_TIMEOUT_MS` | `30000` | 单个工具调用超时上限；实际值还会按「剩余预算 − 收尾预留」收缩 |
 | `AGENT_TOOL_RESULT_MAX` | 按工具 | 单条工具结果进上下文的字符上限。默认 `web_fetch` 6500、`read_doc` 8500（与它们承诺的页大小对齐）、其余 4000；显式设置则全局覆盖 |
 | `AGENT_STREAM_UPSTREAM` | — | Agent 是否流式透传上游输出 |
@@ -572,6 +576,7 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 | `lastStorageError` | 最近一次读写错误的 `op` / `code` / `message` / `hint`。**很关键**：上层把异常当「读不到」处理，「配额满了」会伪装成「知识库是空的」，这里把它摊开 |
 | `mode` | 回显 `STORAGE_BACKEND` 原始取值（拼错时给 `warning`） |
 | `keyPool` | 每个模型下各 key 的掩码、连续失败次数、上次状态码与剩余冷却毫秒数。**不回显 key 原文** |
+| `agent.arithmeticAdoptRate` | 确定性算式预计算的结果被模型采纳的比例（0~1；从未命中过返回 `null`）。配合 `avgToolCalls` / `avgFailed` 可判断准确率增强是否真的落到答案里 |
 
 **默认关闭**，避免对外暴露内部信息。
 
@@ -622,7 +627,9 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 
 | 23 | `agent/memory-layers.js`、`entry.js`、`scripts/selfcheck.mjs` | **三层记忆收口（v7.10.1）**：① 普通对话模式（关闭 Agent）用 `tee()` 旁路写回 L1/L2——旧实现只注入不写回，L1/L2 永远为空；② 记忆时间统一按 `Asia/Shanghai` 渲染（旧实现用 UTC，与提示词里写死的「北京时间」矛盾，模型会照着错时间回答）；③ L2 合并改为保留「首条 + 最新」结论（旧实现从头部截断，越合并越丢最新内容）；④ 空作用域不再兜底成 `default`，读写全部短路（旧实现会让所有匿名请求共用一份记忆）；⑤ `/memory` 的 L3 条数改用真实统计（旧实现被检索上限截断）；⑥ 注入预算改为硬上限、同用户并发写加锁、`/memory` 三层并行读；⑦ 自检 231 → 239 项，八条回归用例锁住以上边界 |
 
-**除上表列出的文件外，其余模块（PWA、SSRF 防护、图片链路、服务端工具实现等）均为原样移植，未做改动。**
+| 24 | `agent/accuracy.js`（新增）、`agent/loop.js`、`agent/tools.js`、`entry.js`、`channel.js`、`net/ssrf.js`、`images.js`、`agent/tools-web.js`、`wechat/handler.js`、`scripts/selfcheck.mjs`、`package-lock.json`、`tts-demo.html` | **准确率增强与全量修复（v7.10.2）**：① 新增确定性准确率模块：进模型前用本地计算器把算式精确算好注入（支持中文乘、括号四则、`std`/`sqrt` 等函数；日期、页码范围、带单位数量不误判），并按本次提问生成「时效必查 / 稳定常识直答 / 内部信息不编造」一轮性约束；执行层把 `expr`/`q`/`title`/`start` 等 21 个工具的常见参数错名归一化（含数字字符串转数值、删除已消费别名以稳定缓存 key）；② Agent（带 tools）默认温度 `0.3`、可配 `AGENT_TEMPERATURE`，普通聊天仍 `0.7`；③ `/healthz` 增 `arithmeticAdoptRate` 采纳率观测；④ 微信自接力链加三重闸门（棒数上限 120 / 最小间隔 2s / 每实例 600 次硬顶），`hop` 不再 `% 10000` 回绕，停链后由真实请求唤醒；⑤ SSRF 补齐内网域名后缀、云元数据新域名、6to4 保留段，图片转存与 `web_fetch` 都改为逐跳重定向校验（含 `opaqueredirect` 兼容回退）；⑥ 修复 `package-lock.json` 版本漂移、`WEB_KB_PREFETCH_MS` 默认值分裂（2200 / 2500 → 统一 2500）、`WX_POLL_BUDGET_MS` 默认值、`images.js` / `tools.js` 注释、`tts-demo.html` 的 Cloudflare 遗留文案；⑦ 修掉 `list_docs` 自检断言的偶发失败（同毫秒批量写入导致排序不定），自检 239 → **254 项** |
+
+**除上表列出的文件外，其余模块均为原样移植**（v7.10.2 起 SSRF 防护、图片链路与服务端工具实现也做了安全加固，见第 24 行）。
 
 ---
 
@@ -660,6 +667,14 @@ curl -i -X POST https://<你的域名>/tg-webhook \
     不如模型写的通顺。想要更漂亮的摘要，可以拿 `/memory` 里的条目自己二次加工。
 16. **情景记忆按条数淘汰，不做语义聚类**：同一件事分几天聊会记成几条。检索靠「关键词 +
     时间衰减」把最近最相关的排前面；真要「合并同类项」，用 `save_doc` 存成知识库文档更合适。
+17. **微信自接力链默认不再「无限全天候」**：v7.10.2 起最多连续接力 120 棒（约 50 分钟）后
+    自然停链，之后靠任意真实请求 / 外部监控 ping `/healthz` 重新唤醒（`maybeWakeWxDaemon`
+    有 4 秒节流 + 轮询锁）。这是 Serverless 按调用计费、实例随时可回收的主动取舍：7×24
+    无限自请求既不可靠也不经济。需要严格全天候时设 `WX_RELAY_MAX_HOPS=0` 恢复旧行为，
+    或用平台定时触发器每 30~60 秒 ping 一次 `/healthz`（推荐后者，成本可控且能顺带探活）。
+18. **DNS rebinding 仍需前置 WAF / 出站代理**：`net/ssrf.js` 已覆盖字面量私网、IPv4 简写、
+    IPv6 展开、NAT64、危险域名及逐跳重定向，但「域名在校验之后被解析到内网」这一情形，
+    函数内拿不到底层 DNS 结果，无法在建连时二次校验。
 
 ---
 
@@ -671,7 +686,7 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 node scripts/selfcheck.mjs      # 或 npm run selfcheck
 ```
 
-覆盖 **239 项用例**：模块图加载、R2 契约在双后端的一致性、一致性断言（`strong`
+覆盖 **254 项用例**（20 个分组）：模块图加载、R2 契约在双后端的一致性、一致性断言（`strong`
 是否真带上）、错误可见性（`QUOTA_EXCEEDED` 记录但不破坏上层）、KV key 编码、
 路由、模型解析、Blob 默认后端与命名空间自动创建、KV 绑定自动发现、
 `/healthz` 排障输出、生图链路（含 5 种响应形态）、页面内联脚本合法性、
@@ -710,7 +725,12 @@ L2 同主题合并与容量上限、按关键词删除、**跨层召回带层标
 **时间按北京时间渲染且跨日正确**、**L2 合并保留最新结论**、
 **注入预算是硬上限（400 与 120 两档都守得住）**、**`/memory` 报真实条数而非检索上限**、
 **普通对话模式也写回记忆且不改写客户端流**、**Web 缺 session_id 时读不到 `web_default` 里的内容**、
-**L3 对空作用域同样短路，不碰公共桶**）。
+**L3 对空作用域同样短路，不碰公共桶**），
+以及 v7.10.2 的准确率增强与修复回归（**确定性算式预计算给出精确值**、日期/页码范围/带单位数量不误判、
+六类提问意图识别、时效 / 直答 / 诚实约束按需注入、**无工具的普通聊天不注入「必须调工具」**、
+参数别名归一化与缓存 key 稳定、**Agent 温度 0.3 与显式覆盖优先级**、SSRF 新增拦截项、
+**302 指向内网立即拒绝且合法 302 仍能转存**、版本号与默认值一致性、
+微信自接力链三重闸门、**端到端模拟上游确认提示真的进入请求体**、`/healthz` 的预计算采纳率字段）。
 
 本地起服务调试（需 `npm i -g edgeone`）：`edgeone makers dev`
 
@@ -719,6 +739,10 @@ L2 同主题合并与容量上限、按关键词删除、**跨层召回带层标
 自检只能证明「接线对」，证明不了「答得对」。要测后者用评测脚本，它真的调一次模型，
 跑 6 个「答错就会被用户立刻发现」的场景：稳定知识不该乱调工具、实时问题必须调工具、
 算数不能心算、不知道要说不知道、时间类走 `get_time`、不泄露系统提示词。
+
+> v7.10.2 起这 6 个场景都有确定性兜底：算数题在进模型前就由本地计算器算出精确值放进
+> 提示词；稳定常识 / 时效问题 / 内部信息分别注入「直接答」「必查工具」「不知道就说不知道」
+> 的一轮性约束。想量化收益，设 `AGENT_ACCURACY_HINT=0` 再跑一次对比通过数。
 
 ```bash
 EVAL_API_URL=https://api.deepseek.com/chat/completions \
@@ -782,6 +806,10 @@ node scripts/eval-agent.mjs        # 或 npm run eval
 | 生图有水印 | `IMAGE_WATERMARK=false` 重部署（日日新公测期去水印免费） |
 | `/` 正常但 `/api/chat`、`/sw.js` 404 | 平台没把根级 `[[default]].js` 当兜底路由：移到 `cloud-functions/api/[[default]].js` 并在 `edgeone.json` 配 `rewrites`，或在控制台把该函数路由配成 `/*` |
 | `/tg-webhook` 返回 404 | 同上，先确认兜底路由生效（`/tg-setup` 返回 403 即说明路由通了） |
+| 微信机器人挂机一段时间后不再自动回复 | v7.10.2 起自接力链默认跑满 120 棒（约 50 分钟）自然停链，是刻意的成本控制。用平台定时触发器每 30~60 秒 ping 一次 `/healthz` 即可自动唤醒；或设 `WX_RELAY_MAX_HOPS=0` 恢复无限接力（会持续产生函数调用费用） |
+| Agent 算数仍给出近似值 | 看 `/healthz` 的 `debug.agent.arithmeticAdoptRate`：接近 1 说明预计算被采纳；`null` 表示从没命中过算式（确认 `AGENT_ACCURACY_HINT` 不是 `0`）。也可跑 `npm run eval` 看「算数不心算」场景 |
+| 想 A/B 对比准确率增强有没有用 | 设 `AGENT_ACCURACY_HINT=0` 重部署跑一轮 `npm run eval`，再设回 `1` 跑一轮；对比 `/healthz` 的 `avgFailed` 与 `arithmeticAdoptRate` |
+| 图片转存失败且上游会 302 跳转 | v7.10.2 起逐跳校验重定向，跳到内网 / 本机 / 云元数据地址会直接拒绝（安全预期，不是 bug）。若上游合法跳到 CDN 仍失败，检查 `IMAGE_TIMEOUT_MS` 与 `IMAGE_MAX_MB` |
 
 ### 路由约定（部署前确认）
 
